@@ -12,7 +12,8 @@ let SEC: Int64 = 1_000_000_000
 enum Clock {
     private static let start = DispatchTime.now().uptimeNanoseconds
     static func nanos() -> Int64 {
-        Int64(DispatchTime.now().uptimeNanoseconds - start) + 3_600_000_000_000
+        let s = start // initialised first: the clock never reads before its start
+        return Int64(DispatchTime.now().uptimeNanoseconds - s) + 3_600_000_000_000
     }
 }
 
