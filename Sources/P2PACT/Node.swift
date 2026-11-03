@@ -646,6 +646,23 @@ public final class Node {
         }
     }
 
+    /// afterEvents completes when everything already received from the device on the stream (its
+    /// events and calls) has run through onEvent and the handlers. A call's result completes as it
+    /// arrives, ahead of the events queued before it: a client that must have all of them (a chat's
+    /// history before the answer to `session/load`) waits for this after the result. Do not wait
+    /// for it inside onEvent of the same stream: it would wait for itself.
+    public func afterEvents(_ peer: String, stream: Int64 = 0) -> Future<Void> {
+        let f = Future<Void>()
+        post { [unowned self] in
+            if let ps = self.peerState(peer) { self.enqueue(ps, stream) { f.complete(()) } } else { f.complete(()) }
+        }
+        if onLoop({ closed }) { f.complete(()) }
+        return f
+    }
+
+    /// knownPeers lists the paired devices.
+    public func knownPeers() -> [Peer] { trust.list() }
+
     /// paths lists live roads to a known device: udp, tcp, relay:<address>.
     public func paths(_ peer: String) -> [String] {
         onLoop {
