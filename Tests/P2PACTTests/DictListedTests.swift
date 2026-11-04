@@ -64,8 +64,10 @@ final class DictListedTests: XCTestCase {
         let raw = try dictBytes(0)
         try a.addDict(raw)
         try b.addDict(raw)
-        eventually("a sees b's list") { a.dictState(b.id.addr).using != nil }
-        eventually("b sees a's list") { b.dictState(a.id.addr).using != nil }
+        // a compresses with the dictionary itself (not just the common one) and b with it for a: the lists are settled
+        let rid = dictId(raw)
+        eventually("a sees b's list") { a.dictState(b.id.addr).using == rid }
+        eventually("b sees a's list") { b.dictState(a.id.addr).using == rid }
         let lock = NSLock()
         var asked = 0
         a.handle(0, 5) { _, _ in
