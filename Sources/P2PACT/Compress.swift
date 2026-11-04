@@ -11,6 +11,9 @@ let MSG_MAX = 16 << 20
 let ZIP_MIN = 64
 /// ZIP_FAST_FROM: from this size on, a faster level.
 let ZIP_FAST_FROM = 32 << 10
+/// ZIP_DICT_FAST_FROM: with a dictionary libzstd's level 3 is far weaker than Go's (1.8x the bytes at 40 KB),
+/// so level 7 is kept up to this size and the fast level starts here.
+let ZIP_DICT_FAST_FROM = 1 << 20
 /// ZIP_QUICK_BELOW: shorter messages with a dictionary at the fastest level.
 let ZIP_QUICK_BELOW = 1 << 10
 /// DICT_KEEP is how many dictionaries of one kind to keep.
@@ -79,7 +82,7 @@ final class Dict {
 
     func encoder(_ size: Int) -> OpaquePointer? {
         lock.lock(); defer { lock.unlock() }
-        if size >= ZIP_FAST_FROM {
+        if size >= ZIP_DICT_FAST_FROM {
             if fast == nil { fast = make(LEVEL_FAST) }
             return fast
         } else if size < ZIP_QUICK_BELOW {

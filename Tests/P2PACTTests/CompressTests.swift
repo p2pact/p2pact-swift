@@ -81,6 +81,17 @@ final class CompressTests: XCTestCase {
         }
     }
 
+    /// Swift compresses about as well as Go (the level is the sender's choice, but a far weaker one costs the
+    /// pair's bytes): the same input and dictionary within 10 % of the Go reference's size.
+    func testSizeCloseToGo() throws {
+        let d = try common()
+        for (kind, n, h) in goVectors where !h.isEmpty {
+            let goSize = h.count / 2
+            guard let z = compress(msg(n), kind == "dict" ? d : nil, kind == "dict" ? 1 : 0) else { return XCTFail("\(kind) \(n)") }
+            XCTAssertLessThanOrEqual(Double(z.count), Double(goSize) * 1.10, "\(kind) \(n): swift \(z.count) go \(goSize)")
+        }
+    }
+
     // Swift output for the Go reference to decode (checked by a Go test; only with P2PACT_VEC_OUT set)
     func testWriteSwiftVectors() throws {
         guard let out = ProcessInfo.processInfo.environment["P2PACT_VEC_OUT"] else { return }
