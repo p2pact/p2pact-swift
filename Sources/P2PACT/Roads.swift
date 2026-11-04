@@ -314,6 +314,56 @@ func waitReadable(_ fd: Int32, _ ms: Int32) -> Bool {
 
 // MARK: UDP
 
+/// primeIdle: after this long without a datagram to a public address the NAT may have dropped our mapping, and the
+/// next one primes it again (carrier NATs keep UDP mappings 30 s or more). primeGap: datagrams to public addresses
+/// wait this long behind a prime — a NAT takes a moment to apply it, and a flow that overtakes it gets a port of its
+/// own. primePort is the STUN port (RFC 8489), the port a NAT is primed on; primeHost says the NAT is on the way to an
+/// address (its IPv4 bytes). Tests change them.
+var primeIdle = 20 * SEC
+var primeGap = 50 * MS
+var primePort = 3478
+var primeHost: ([UInt8]) -> Bool = natPublic
+
+/// primeQueue sends the datagrams that wait behind a prime.
+private let primeQueue = DispatchQueue(label: "p2pact-prime")
+
+/// natPublic: a public IPv4 address, reached through a NAT (not a private, carrier-grade NAT, loopback or link-local one).
+func natPublic(_ b: [UInt8]) -> Bool {
+    guard b.count == 4 else { return false }
+    let x = b[0], y = b[1]
+    return !(x == 0 || x == 10 || x == 127 || x >= 224 || (x == 100 && y & 0xc0 == 64) ||
+        (x == 169 && y == 254) || (x == 172 && y & 0xf0 == 16) || (x == 192 && y == 168))
+}
+
+/// ipv4 is the IPv4 address of a, plain or mapped into IPv6; nil — not IPv4.
+func ipv4(_ a: SockAddr) -> [UInt8]? {
+    var ss = a.storage
+    return withUnsafePointer(to: &ss) { p -> [UInt8]? in
+        switch a.family {
+        case AF_INET:
+            return p.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { v4 in withUnsafeBytes(of: v4.pointee.sin_addr) { Array($0) } }
+        case AF_INET6:
+            let b = p.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { v6 in withUnsafeBytes(of: v6.pointee.sin6_addr) { Array($0) } }
+            return b[0..<10].allSatisfy { $0 == 0 } && b[10] == 0xff && b[11] == 0xff ? Array(b[12..<16]) : nil
+        default:
+            return nil
+        }
+    }
+}
+
+/// withPort is a with another port.
+func withPort(_ a: SockAddr, _ port: Int) -> SockAddr {
+    var ss = a.storage
+    withUnsafeMutablePointer(to: &ss) { p in
+        if a.family == AF_INET {
+            p.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_port = in_port_t(port).bigEndian }
+        } else if a.family == AF_INET6 {
+            p.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_port = in_port_t(port).bigEndian }
+        }
+    }
+    return SockAddr(storage: ss, len: a.len)
+}
+
 /// UdpRoad is the main road: one packet is one datagram (spec §3).
 public final class UdpRoad: Road {
     public let name = "udp"
@@ -362,10 +412,44 @@ public final class UdpRoad: Road {
         if drop?() == true { return true }
         if closedFlag.value { return false }
         guard let to = target(addr) else { return false }
+        let wait = prime(to)
+        if wait > 0 {
+            primeQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) { [self] in
+                if !closedFlag.value { _ = write(pkt, to) }
+            }
+            return true
+        }
+        return write(pkt, to)
+    }
+
+    private func write(_ pkt: Bytes, _ to: SockAddr) -> Bool {
         let r = pkt.withUnsafeBytes { b in
             to.with { sa, l in sendto(fd, b.baseAddress, pkt.count, 0, sa, l) }
         }
         return r >= 0
+    }
+
+    // the last datagram to a public IPv4 address and the last prime (see prime), under lock
+    private var publicAt: Int64 = Int64.min / 2
+    private var primedAt: Int64 = Int64.min / 2
+
+    /// prime goes before a datagram to a public IPv4 address when none went to one for primeIdle (spec §7): one byte
+    /// to port 3478 of the same host. Carrier NATs give a socket one mapping for all destinations (endpoint-independent,
+    /// what punching needs) only once it has talked to the STUN port — operators keep WebRTC working that way; before
+    /// that, every destination gets its own port, and the address our relay sees is not the one our devices see. A flow
+    /// opened before keeps its own port, so the byte goes first and the datagram waits primeGap behind it (the result:
+    /// how long to wait, ns). Nothing answers it; a one-byte packet is dropped by every P2PACT receiver.
+    private func prime(_ to: SockAddr) -> Int64 {
+        guard let ip = ipv4(to), primeHost(ip) else { return 0 }
+        let now = Clock.nanos()
+        lock.lock()
+        let idle = now - publicAt >= primeIdle
+        publicAt = now
+        if idle { primedAt = now }
+        let wait = primedAt + primeGap - now
+        lock.unlock()
+        if idle { _ = write([0], withPort(to, primePort)) }
+        return max(wait, 0)
     }
 
     private func target(_ addr: String) -> SockAddr? {
