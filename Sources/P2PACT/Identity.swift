@@ -158,15 +158,19 @@ public struct Hints: Equatable {
     public var udp: [String]
     public var tcp: [String]
     public var relay: RelayHint?
-    public init(udp: [String] = [], tcp: [String] = [], relay: RelayHint? = nil) { self.udp = udp; self.tcp = tcp; self.relay = relay }
+    /// ws: WebSocket URLs of the relay, for browsers (the fourth element; we only carry them).
+    public var ws: [String]
+    public init(udp: [String] = [], tcp: [String] = [], relay: RelayHint? = nil, ws: [String] = []) { self.udp = udp; self.tcp = tcp; self.relay = relay; self.ws = ws }
 
     /// toWire is [UDP addresses, [relay address, fingerprint], TCP addresses].
     func toWire() -> Cbor.Value {
-        .array([
+        var a: [Cbor.Value] = [
             udp.isEmpty ? .null : .array(udp.map { .text($0) }),
             relay.map { .array([.text($0.addr), .text($0.fp)]) } ?? .null,
             tcp.isEmpty ? .null : .array(tcp.map { .text($0) })
-        ])
+        ]
+        if !ws.isEmpty { a.append(.array(ws.map { .text($0) })) } // without it the old three
+        return .array(a)
     }
 
     func toJson() -> [String: Any] {
@@ -174,6 +178,7 @@ public struct Hints: Equatable {
         if !udp.isEmpty { m["udp"] = udp }
         if !tcp.isEmpty { m["tcp"] = tcp }
         if let r = relay { m["relay"] = ["addr": r.addr, "fp": r.fp] }
+        if !ws.isEmpty { m["ws"] = ws }
         return m
     }
 
@@ -181,7 +186,7 @@ public struct Hints: Equatable {
         let a = v.asList ?? []
         func strs(_ x: Cbor.Value) -> [String] { x.asList?.compactMap { $0.asString } ?? [] }
         let r = strs(a.at(1))
-        return Hints(udp: strs(a.at(0)), tcp: strs(a.at(2)), relay: r.count == 2 && !r[0].isEmpty ? RelayHint(addr: r[0], fp: r[1]) : nil)
+        return Hints(udp: strs(a.at(0)), tcp: strs(a.at(2)), relay: r.count == 2 && !r[0].isEmpty ? RelayHint(addr: r[0], fp: r[1]) : nil, ws: strs(a.at(3)))
     }
 
     static func fromJson(_ v: Any?) -> Hints {
@@ -189,7 +194,7 @@ public struct Hints: Equatable {
         func strs(_ x: Any?) -> [String] { (x as? [Any])?.compactMap { $0 as? String } ?? [] }
         var relay: RelayHint?
         if let r = m["relay"] as? [String: Any], let a = r["addr"] as? String { relay = RelayHint(addr: a, fp: r["fp"] as? String ?? "") }
-        return Hints(udp: strs(m["udp"]), tcp: strs(m["tcp"]), relay: relay)
+        return Hints(udp: strs(m["udp"]), tcp: strs(m["tcp"]), relay: relay, ws: strs(m["ws"]))
     }
 }
 
@@ -298,7 +303,7 @@ final class Trust {
         guard var p = peers[addr] else { return }
         if !name.isEmpty { p.name = name }
         if !os.isEmpty { p.os = os }
-        p.hints = Hints(udp: h.udp.isEmpty ? p.hints.udp : h.udp, tcp: h.tcp.isEmpty ? p.hints.tcp : h.tcp, relay: h.relay ?? p.hints.relay)
+        p.hints = Hints(udp: h.udp.isEmpty ? p.hints.udp : h.udp, tcp: h.tcp.isEmpty ? p.hints.tcp : h.tcp, relay: h.relay ?? p.hints.relay, ws: h.ws.isEmpty ? p.hints.ws : h.ws)
         peers[addr] = p
         save()
     }

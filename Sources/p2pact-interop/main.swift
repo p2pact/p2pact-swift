@@ -152,6 +152,10 @@ func handle(_ req: [String: Any]) throws {
         if let t = req["tcp"] as? String { try node.listenTcp(t) }
         if let r = req["relay"] as? String { node.setRelay(RelayHint(addr: r, fp: req["fp"] as? String ?? "")) }
         say(["addr": node.id.addr, "udp": node.udpAddr, "tcp": node.tcpAddr])
+    case "relay":
+        node.setRelay(RelayHint(addr: str("addr"), fp: str("fp")))
+        node.setRelayWS((req["ws"] as? [Any])?.compactMap { $0 as? String } ?? [])
+        say(["ok": true])
     case "invite":
         say(["invite": node.invite(ttlMs: 600_000).string])
     case "join":

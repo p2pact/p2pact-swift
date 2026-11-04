@@ -157,8 +157,53 @@ struct SockAddr {
         if r != 0 { return "" }
         var h = String(cString: host)
         if let pct = h.firstIndex(of: "%") { h = String(h[..<pct]) }
+        if h.lowercased().hasPrefix("::ffff:"), h.contains(".") { h = String(h.dropFirst(7)) } // IPv4 on a dual-stack socket
         return joinHostPort(h, Int(String(cString: serv)) ?? 0)
     }
+}
+
+/// listenAddrs are the addresses to try for a listen address: "" (all) — IPv6 any, which takes IPv4 too (dual stack,
+/// as Go's ":port"), then IPv4 any for a host without IPv6.
+func listenAddrs(host: String, port: Int, type: Int32) -> [SockAddr] {
+    if host.isEmpty {
+        return resolve(host: "", port: port, family: AF_INET6, type: type, passive: true)
+            + resolve(host: "", port: port, family: AF_INET, type: type, passive: true)
+    }
+    return resolve(host: host, port: port, family: AF_UNSPEC, type: type, passive: true)
+}
+
+/// openListenSocket opens and binds a socket on the first address that works; v6 sockets accept IPv4 as well.
+func bindFirst(_ addrs: [SockAddr], _ type: Int32, prepare: (Int32) -> Void) -> (Int32, SockAddr)? {
+    for sa in addrs {
+        let s = openSocket(sa.family, type)
+        if s < 0 { continue }
+        if sa.family == AF_INET6 { setIntOpt(s, Int32(IPPROTO_IPV6), IPV6_V6ONLY, 0) }
+        prepare(s)
+        if sa.with({ sysBind(s, $0, $1) }) == 0 { return (s, sa) }
+        Darwin_close(s)
+    }
+    return nil
+}
+
+/// v4Mapped turns an IPv4 address into the IPv6 form a dual-stack socket sends to.
+func v4Mapped(_ a: SockAddr) -> SockAddr {
+    if a.family != AF_INET { return a }
+    var ss = a.storage
+    var out = sockaddr_in6()
+    withUnsafePointer(to: &ss) { p in
+        p.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { v4 in
+            out.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            out.sin6_family = sa_family_t(AF_INET6)
+            out.sin6_port = v4.pointee.sin_port
+            withUnsafeMutableBytes(of: &out.sin6_addr) { b in
+                for i in 10..<12 { b[i] = 0xff }
+                withUnsafeBytes(of: v4.pointee.sin_addr) { for i in 0..<4 { b[12 + i] = $0[i] } }
+            }
+        }
+    }
+    var st = sockaddr_storage()
+    memcpy(&st, &out, MemoryLayout<sockaddr_in6>.size)
+    return SockAddr(storage: st, len: socklen_t(MemoryLayout<sockaddr_in6>.size))
 }
 
 func sockAddr(fromStorage ss: sockaddr_storage, len: socklen_t) -> SockAddr { SockAddr(storage: ss, len: len) }
@@ -288,18 +333,14 @@ public final class UdpRoad: Road {
     init(bind: String, recv: @escaping Receiver) throws {
         self.recv = recv
         let (host, port) = bindParts(bind)
-        guard let sa = resolve(host: host, port: port, family: host.isEmpty ? AF_INET : AF_UNSPEC, type: SOCK_DGRAM, passive: true).first else {
-            throw P2pactIOError("cannot resolve \(bind)")
-        }
-        let s = openSocket(sa.family, SOCK_DGRAM)
-        if s < 0 { throw P2pactIOError("cannot open a socket") }
+        let cands = listenAddrs(host: host, port: port, type: SOCK_DGRAM)
+        if cands.isEmpty { throw P2pactIOError("cannot resolve \(bind)") }
         // a burst of retransmissions must not overflow the receive queue
-        setIntOpt(s, SOL_SOCKET, SO_RCVBUF, 1 << 20)
-        setIntOpt(s, SOL_SOCKET, SO_SNDBUF, 1 << 20)
-        if sa.with({ Darwin_bind(s, $0, $1) }) != 0 {
-            let e = errno
-            Darwin_close(s)
-            throw P2pactIOError("cannot bind \(bind): \(String(cString: strerror(e)))")
+        guard let (s, sa) = bindFirst(cands, SOCK_DGRAM, prepare: { s in
+            setIntOpt(s, SOL_SOCKET, SO_RCVBUF, 1 << 20)
+            setIntOpt(s, SOL_SOCKET, SO_SNDBUF, 1 << 20)
+        }) else {
+            throw P2pactIOError("cannot bind \(bind): \(String(cString: strerror(errno)))")
         }
         fd = s
         family = sa.family
@@ -324,7 +365,8 @@ public final class UdpRoad: Road {
         var to = addrs[addr]
         lock.unlock()
         if to == nil {
-            guard let (h, p) = hostPort(addr), let a = resolve(host: h, port: p, family: family, type: SOCK_DGRAM).first else { return false }
+            guard let (h, p) = hostPort(addr), let r = resolve(host: h, port: p, family: family == AF_INET6 ? AF_UNSPEC : family, type: SOCK_DGRAM).first else { return false }
+            let a = family == AF_INET6 ? v4Mapped(r) : r // a dual-stack socket sends IPv4 as mapped
             lock.lock(); addrs[addr] = a; lock.unlock()
             to = a
         }
@@ -611,13 +653,12 @@ public final class TcpRoad: StreamRoad {
         super.init(name: "tcp", recv: recv)
         if bind.isEmpty { return }
         let (host, port) = bindParts(bind)
-        guard let sa = resolve(host: host, port: port, family: host.isEmpty ? AF_INET : AF_UNSPEC, type: SOCK_STREAM, passive: true).first else {
-            throw P2pactIOError("cannot resolve \(bind)")
+        let cands = listenAddrs(host: host, port: port, type: SOCK_STREAM)
+        if cands.isEmpty { throw P2pactIOError("cannot resolve \(bind)") }
+        guard let (s, sa) = bindFirst(cands, SOCK_STREAM, prepare: { setIntOpt($0, SOL_SOCKET, SO_REUSEADDR, 1) }) else {
+            throw P2pactIOError("cannot listen on \(bind): \(String(cString: strerror(errno)))")
         }
-        let s = openSocket(sa.family, SOCK_STREAM)
-        if s < 0 { throw P2pactIOError("cannot open a socket") }
-        setIntOpt(s, SOL_SOCKET, SO_REUSEADDR, 1)
-        if sa.with({ sysBind(s, $0, $1) }) != 0 || listen(s, 128) != 0 {
+        if listen(s, 128) != 0 {
             let e = errno
             Darwin_close(s)
             throw P2pactIOError("cannot listen on \(bind): \(String(cString: strerror(e)))")

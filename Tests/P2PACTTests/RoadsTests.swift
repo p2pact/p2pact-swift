@@ -38,7 +38,7 @@ final class RoadsTests: XCTestCase {
         XCTAssertEqual(a.localAddrs(), [a.localAddr])
         let all = try UdpRoad(bind: ":0") { _, _ in }
         defer { all.close() }
-        XCTAssertTrue(all.localAddr.hasPrefix("0.0.0.0:"))
+        XCTAssertTrue(all.localAddr.hasPrefix("[::]:") || all.localAddr.hasPrefix("0.0.0.0:")) // dual stack, IPv4 only without IPv6
         let v6 = try UdpRoad(bind: "[::1]:0") { _, _ in }
         defer { v6.close() }
         XCTAssertTrue(v6.localAddr.hasPrefix("[::1]:"))

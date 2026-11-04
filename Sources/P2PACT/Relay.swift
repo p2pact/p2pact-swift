@@ -126,6 +126,10 @@ public final class RelayRoad: Road {
     private let recv: Receiver
     private let lock = NSLock()
     private var channels = [String: Chan]()
+    private let keepalive: TimeInterval
+    private let pongCount = Counter()
+    /// sessions counts connections established (tests: a reconnect is a new one).
+    private let sessionCount = Counter()
 
     private final class Chan {
         let channel: String
@@ -149,8 +153,10 @@ public final class RelayRoad: Road {
         }
     }
 
-    init(hint: RelayHint, recv: @escaping Receiver) {
+    /// keepalive: how often an idle connection says "p" (the relay drops a silent one after 90 s).
+    init(hint: RelayHint, keepalive: TimeInterval = 25, recv: @escaping Receiver) {
         self.hint = hint
+        self.keepalive = keepalive
         self.recv = recv
         self.name = "relay:" + hint.addr
     }
@@ -184,6 +190,10 @@ public final class RelayRoad: Road {
 
     /// open counts joined channels (tests).
     var open: Int { lock.lock(); defer { lock.unlock() }; return channels.count }
+    /// pongs counts the relay's answers to our keepalives (tests).
+    var pongs: Int { pongCount.value }
+    var sessions: Int { sessionCount.value }
+    var keepaliveSeconds: TimeInterval { keepalive }
 
     private func keep(_ c: Chan) {
         var backoff = 0.5
@@ -205,11 +215,12 @@ public final class RelayRoad: Road {
         if !s.send(Bytes(hello.utf8)) { return false }
         let rd = LineReader(s)
         guard let first = rd.readLine(timeout: 15), first.contains("\"ok\":true") else { return false }
+        sessionCount.add()
         let alive = AtomicFlag()
         alive.set(true)
-        spawn("p2pact-relay-w") {
+        spawn("p2pact-relay-w") { [self] in
             while !c.stopped.value && alive.value {
-                let pkt = c.out.poll(timeout: 25, cancel: { c.stopped.value || !alive.value })
+                let pkt = c.out.poll(timeout: self.keepalive, cancel: { c.stopped.value || !alive.value })
                 if !alive.value || c.stopped.value { break }
                 let line = pkt.map { b64($0) + "\n" } ?? "p\n"
                 if !s.send(Bytes(line.utf8)) { break }
@@ -220,7 +231,8 @@ public final class RelayRoad: Road {
         while !c.stopped.value {
             guard let raw = rd.readLine(timeout: 90) else { break }
             let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty || line == "P" { continue }
+            if line == "P" { pongCount.add(); continue }
+            if line.isEmpty { continue }
             guard let pkt = unb64(line) else { continue }
             if pkt.count > MAX_PACKET + 64 { continue }
             recv(pkt, ep)
@@ -229,4 +241,11 @@ public final class RelayRoad: Road {
         c.out.nudge()
         return true
     }
+}
+
+private final class Counter {
+    private let l = NSLock()
+    private var n = 0
+    var value: Int { l.lock(); defer { l.unlock() }; return n }
+    func add() { l.lock(); n += 1; l.unlock() }
 }

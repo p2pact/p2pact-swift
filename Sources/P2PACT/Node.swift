@@ -192,6 +192,7 @@ public final class Node {
     private var udp: UdpRoad?
     private var tcp: TcpRoad?
     private var ownRelay: RelayHint?
+    private var ownWS: [String] = [] // WebSocket URLs of our relay, for the hints (setRelayWS)
     private var relays: [String: RelayRoad] = [:] // by server address
     private var apps: [AttachedRoad] = [] // roads the application provides
     private var advertise: Hints?
@@ -331,6 +332,10 @@ public final class Node {
 
     /// setRelay sets our relay: used for pairing and pair channels.
     public func setRelay(_ h: RelayHint?) { onLoop { ownRelay = h } }
+
+    /// setRelayWS tells the WebSocket URLs of our relay (the one given to setRelay, as browsers dial it): they go into
+    /// our invites and hellos. This library does not dial them.
+    public func setRelayWS(_ urls: [String]) { onLoop { ownWS = urls } }
 
     /// setAdvertise announces these hints instead of our own addresses; nil — our own again.
     public func setAdvertise(_ h: Hints?) { onLoop { advertise = h } }
@@ -694,9 +699,10 @@ public final class Node {
     private func hints() -> Hints {
         if var a = advertise {
             if a.relay == nil, let r = ownRelay { a.relay = r }
+            if a.ws.isEmpty { a.ws = ownWS }
             return a
         }
-        return Hints(udp: udp?.localAddrs() ?? [], tcp: tcp?.localAddrs() ?? [], relay: ownRelay)
+        return Hints(udp: udp?.localAddrs() ?? [], tcp: tcp?.localAddrs() ?? [], relay: ownRelay, ws: ownWS)
     }
 
     // --- receiving ---
@@ -836,7 +842,7 @@ public final class Node {
         hs.removeValue(forKey: local)
         let peer = Crypto.address(inv.key)
         let wh = pp.hints
-        let hints = Hints(udp: wh.udp.isEmpty ? inv.hints.udp : wh.udp, tcp: wh.tcp.isEmpty ? inv.hints.tcp : wh.tcp, relay: wh.relay ?? inv.hints.relay)
+        let hints = Hints(udp: wh.udp.isEmpty ? inv.hints.udp : wh.udp, tcp: wh.tcp.isEmpty ? inv.hints.tcp : wh.tcp, relay: wh.relay ?? inv.hints.relay, ws: wh.ws.isEmpty ? inv.hints.ws : wh.ws)
         let p = Peer(addr: peer, key: inv.key, name: pp.name, pairSecret: inv.secret, hints: hints, signKey: pp.signKey, os: pp.os,
                      kind: pp.kind, granted: h.wants != nil ? [] : nil, local: isLocal(from)) // asked: nothing until the first 0.6 (spec §2)
         trust.put(p)
