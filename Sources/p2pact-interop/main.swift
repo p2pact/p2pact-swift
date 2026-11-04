@@ -156,6 +156,16 @@ func handle(_ req: [String: Any]) throws {
         node.setRelay(RelayHint(addr: str("addr"), fp: str("fp")))
         node.setRelayWS((req["ws"] as? [Any])?.compactMap { $0 as? String } ?? [])
         say(["ok": true])
+    case "advertise": // {"hints":{"udp":[…],"tcp":[…]}} instead of our own addresses; no hints — our own again
+        if let h = req["hints"] as? [String: Any] {
+            func list(_ k: String) -> [String] { (h[k] as? [Any])?.compactMap { $0 as? String } ?? [] }
+            node.setAdvertise(Hints(udp: list("udp"), tcp: list("tcp")))
+        } else {
+            node.setAdvertise(nil)
+        }
+        say(["ok": true])
+    case "paths":
+        say(["paths": node.paths(str("peer"))])
     case "invite":
         say(["invite": node.invite(ttlMs: 600_000).string])
     case "join":

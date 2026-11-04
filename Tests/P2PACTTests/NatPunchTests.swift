@@ -105,6 +105,58 @@ final class NatPunchTests: XCTestCase {
         XCTAssertEqual(b.hintsForTest().udp, [b.udpAddr])
     }
 
+    /// A relay that stops answering: its last answer goes stale and the reflexive address leaves the hints.
+    func testUnansweredReflexiveDropped() throws {
+        let saved = (observeEvery, reflexiveStale)
+        observeEvery = 200 * MS
+        reflexiveStale = 1500 * MS
+        defer { (observeEvery, reflexiveStale) = saved }
+        let relay = try FakeObserver()
+        defer { relay.close() }
+        relay.answer = "203.0.113.7:40000"
+        let a = try node("A")
+        defer { a.close() }
+        a.setRelay(relay.hint)
+        eventually("observed") { a.reflexiveForTest() == "203.0.113.7:40000" }
+        relay.answer = nil
+        eventually("dropped") { a.reflexiveForTest() == nil }
+        XCTAssertEqual(a.hintsForTest().udp, [a.udpAddr])
+        relay.answer = "203.0.113.7:40000"
+        eventually("observed again") { a.reflexiveForTest() == "203.0.113.7:40000" }
+    }
+
+    /// Forced observes (relay set, socket opened, resumed) go out at most once a second.
+    func testForcedObservesOncePerSecond() throws {
+        let relay = try FakeObserver()
+        defer { relay.close() }
+        let a = try node("A")
+        defer { a.close() }
+        for _ in 0..<5 { a.setRelay(relay.hint) }
+        eventually("asked") { !relay.requests.isEmpty }
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(relay.requests.count, 1)
+        // the pending forced one goes once its second is up, once
+        eventually("asked again") { relay.requests.count == 2 }
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(relay.requests.count, 2)
+    }
+
+    /// Advertised hints get the reflexive address too: it is where our socket is reached from outside.
+    func testReflexiveJoinsAdvertisedHints() throws {
+        let saved = observeEvery
+        observeEvery = 200 * MS
+        defer { observeEvery = saved }
+        let relay = try FakeObserver()
+        defer { relay.close() }
+        relay.answer = "203.0.113.7:40000"
+        let a = try node("A")
+        defer { a.close() }
+        a.setAdvertise(Hints(udp: [], tcp: [], relay: nil))
+        a.setRelay(relay.hint)
+        eventually("observed") { a.reflexiveForTest() == "203.0.113.7:40000" }
+        XCTAssertEqual(a.hintsForTest().udp, ["203.0.113.7:40000"])
+    }
+
     func testObserveReplyChecks() throws {
         let relay = try FakeObserver() // never answers on its own
         let rogue = Inbox()

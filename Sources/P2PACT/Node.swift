@@ -15,6 +15,10 @@ var probeEvery = 30 * SEC
 /// observeEvery: how often we ask our relay which address our UDP packets come from (NAT hole punching).
 var observeEvery = 25 * SEC
 
+/// reflexiveStale: a reflexive address the relay has not confirmed for this long leaves our hints (3 missed answers
+/// and some); tests shorten it.
+var reflexiveStale = 80 * SEC
+
 /// A punch burst sends a keepalive to every UDP address of the device every punchEvery, for punchFor.
 var punchEvery = 200 * MS
 var punchFor = 3 * SEC
@@ -209,6 +213,8 @@ public final class Node {
     private var hintsAt: Int64 = 0
     private var reflexive: String? // our address as the relay sees it (observe), part of our UDP hints
     private var observeAt: Int64 = 0 // when the last observe went out (0 — none yet)
+    private var observeForce = false // a forced request waits for its second (observeNow)
+    private var observeGot: Int64 = 0 // the relay last answered
     private var observeNonces: [Bytes] = [] // outstanding requests to the relay, newest last
 
     private var sessions: [Int64: Session] = [:] // by our index
@@ -291,7 +297,7 @@ public final class Node {
         let u = try UdpRoad(bind: addr) { [weak self] p, e in self?.receiveFromRoad(p, e) }
         onLoop {
             udp = u
-            observeNow(Clock.nanos())
+            observeNow(Clock.nanos(), force: true) // a new socket has its own mapping
         }
     }
 
@@ -351,10 +357,9 @@ public final class Node {
             if ownRelay?.addr != h?.addr { // another relay sees another address
                 reflexive = nil
                 observeNonces = []
-                observeAt = 0
             }
             ownRelay = h
-            observeNow(Clock.nanos())
+            observeNow(Clock.nanos(), force: true)
         }
     }
 
@@ -418,8 +423,7 @@ public final class Node {
             return
         }
         let now = Clock.nanos()
-        observeAt = 0
-        observeNow(now)
+        observeNow(now, force: true) // the mapping may have changed in the sleep
         if let h = ownRelay { for k in invites.keys { relay(h).join(k, "a") } }
         for p in trust.list() {
             joinPair(p)
@@ -743,11 +747,17 @@ public final class Node {
 
     // --- NAT hole punching ---
 
-    /// observeNow asks the relay which address our UDP packets come from (every observeEvery, or at once with
-    /// observeAt = 0). An old relay never answers: harmless.
-    private func observeNow(_ now: Int64) {
+    /// observeNow asks the relay which address our UDP packets come from: every observeEvery, or at once (force:
+    /// relay set, socket changed, resumed) — but not more than once a second; a forced request that comes too soon
+    /// waits for maintain. A reflexive address the relay has not confirmed for reflexiveStale is dropped (another
+    /// network, an old relay). An old relay never answers: harmless.
+    private func observeNow(_ now: Int64, force: Bool = false) {
+        if force { observeForce = true }
         guard !paused, !closed, let u = udp, let h = ownRelay else { return }
-        if observeAt != 0 && now - observeAt < observeEvery { return }
+        let gap = now - observeAt
+        if observeAt != 0 && (gap < min(SEC, observeEvery) || (!observeForce && gap < observeEvery)) { return }
+        if reflexive != nil && now - observeGot > reflexiveStale { setReflexive(now, nil) }
+        observeForce = false
         observeAt = now
         let nonce = randomBytes(16)
         observeNonces.append(nonce)
@@ -761,14 +771,18 @@ public final class Node {
         guard let u = udp, from.road === u, let h = ownRelay, let r = decodeObserve(pkt),
               let i = observeNonces.firstIndex(of: r.nonce), u.resolvedText(h.addr) == from.addr else { return }
         observeNonces.remove(at: i) // answered once
-        learnReflexive(now, r.addr)
+        observeGot = now
+        setReflexive(now, r.addr)
     }
 
-    private func learnReflexive(_ now: Int64, _ addr: String) {
+    /// setReflexive records our address as the relay sees it (nil — forget it): announced at once; a new one starts
+    /// bursts to the devices not on a direct road.
+    private func setReflexive(_ now: Int64, _ addr: String?) {
         if reflexive == addr { return }
         reflexive = addr // replaces the old one
         hintsAt = 0
         reannounce(now) // the hello carries it
+        if addr == nil { return }
         for (peer, ps) in peers where !onDirect(peer, ps, now) { startBurst(now, ps) }
     }
 
