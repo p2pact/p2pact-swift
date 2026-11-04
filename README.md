@@ -11,6 +11,15 @@ Swift implementation of [P2PACT](https://github.com/p2pact/p2pact) (macOS 13+, i
   default). The two devices need nothing: they learn it from the hello and use the road
   `via:<forwarder>` (`paths`), ranked with an application road. `forwards`, `forwarders` and
   `forwardStats` tell who forwards for whom and how much.
+- Tool 5 `p2pact.term` (terminals, `spec/term.md`) is a tool of the spec: `fixedTool("p2pact.term")` is 5,
+  and the application serves it with `handleToolAll("p2pact.term", handler)` (announced in the hello's
+  `{tool: version}`; the node requires read, the handler checks the rest). A terminal a device served
+  before under a name of its own (a named tool from 64 up) is a *former name* (spec §8.1):
+  `aliasTool(former, "p2pact.term")` makes grants on either name count for both (`levelIn`, the highest wins),
+  `callToolOn` / `resolveTool` call 5 when the device announces it and the former name otherwise
+  (`peerHasTool` tells what the hello announced), and events under 5 are `p2pact.term`
+  (`peerToolName`). `P2PACTClient` has `Tools.term` and `Computer.callTool(Tools.term, …)`; there is no
+  typed terminal client.
 - `p2pact-interop`: the JSON-line peer of [p2pact-tests](https://github.com/p2pact/p2pact-tests)
   (`P2PACT_SWIFT=.build/release/p2pact-interop go test ./interop`).
 

@@ -134,6 +134,7 @@ private final class PeerState {
     var askedInfo: Int64 = 0
     var fetching = false
     var named: [String: ToolRef] = [:] // its named tools, from its hello (spec §8)
+    var fixed: [Int: Int]? // its tools of the spec, {tool: version} from its hello; nil — no hello yet
     var tried: [Bytes] = [] // dictionaries of its list we asked it for and did not get
     var sysCalls = Set<Int64>() // our calls of tool 0: their results are not conversation
     var inbox: [Int64: Inbox] = [:] // calls and events waiting for their turn, per stream
@@ -235,6 +236,7 @@ public final class Node {
     private var names: [String: Int] = [:]
     private var numbers: [Int: String] = [:]
     private var versions: [Int: Int] = [:]
+    private var aliases: [String: String] = [:] // a former name → the tool's name now (aliasTool)
     private var resetAt: [String: Int64] = [:]
     private let dicts: DictStore
     private var learnerStore: Learner?
@@ -466,7 +468,13 @@ public final class Node {
     /// grantedBy is what a device lets us use of its tools, as it told us (event 0.6).
     public func grantedBy(_ peer: String) -> [Grant]? { trust.get(peer)?.offered() }
 
-    public func level(_ peer: String, _ tool: String) -> Int { trust.get(peer).map { grantLevel($0.grants, tool) } ?? 0 }
+    public func level(_ peer: String, _ tool: String) -> Int { trust.get(peer).map { levelIn($0.grants, tool) } ?? 0 }
+
+    /// levelIn is grantLevel over a tool's names: the highest level a list of grants gives on the tool or any of
+    /// its former names (aliasTool, spec §8.1).
+    public func levelIn(_ grants: [Grant]?, _ tool: String) -> Int {
+        onLoop { toolNames(tool).reduce(0) { max($0, grantLevel(grants, $1)) } }
+    }
 
     /// setGrants replaces what a trusted device may use, keeps it with the trust and tells the device with event 0.6.
     public func setGrants(_ peer: String, _ grants: [Grant]) throws {
@@ -514,10 +522,40 @@ public final class Node {
         handle(num, method, h)
     }
 
-    /// handleToolAll serves every method of the named tool with h.
+    /// handleToolAll serves every method of the named tool with h. A tool of the spec (a name of fixedTool, such as
+    /// "p2pact.term") is served under its fixed number and announced in the hello's {tool: version}.
     public func handleToolAll(_ name: String, _ h: @escaping ToolHandler) throws {
+        if let num = FIXED_TOOLS[name] {
+            onLoop {
+                toolHandlers[num] = h
+                reannounceTools()
+            }
+            return
+        }
         let num = try registerTool(name, 1)
         onLoop { toolHandlers[num] = h }
+    }
+
+    /// aliasTool declares alias a former name of the tool canonical (spec §8.1): a device may serve one tool
+    /// under both names, the spec's (say "p2pact.term", tool 5) and the one it had before (say
+    /// "dev.nomadcode.term", a named tool from 64 up). Grants on either name count for both: a call or an event
+    /// of either gets the highest level granted on any of them (levelIn). A callTool by canonical falls back to
+    /// the alias on a device that announces only that. Serve the alias as any named tool (handleToolAll, the
+    /// same handler as canonical's) and answer and send events under the number it was called by.
+    public func aliasTool(_ alias: String, _ canonical: String) throws {
+        if !validToolName(alias) { throw P2pactError(Errors.badArgs, "bad alias: \(alias)") }
+        if FIXED_TOOLS[canonical] == nil && !validToolName(canonical) { throw P2pactError(Errors.badArgs, "bad tool name: \(canonical)") }
+        try onLoopThrowing {
+            let target = aliases[canonical] ?? canonical // an alias of an alias names the same tool
+            if alias == target { throw P2pactError(Errors.badArgs, "a tool is not its own alias: \(alias)") }
+            aliases[alias] = target
+        }
+    }
+
+    /// toolNames is a tool name with its aliases: the tool's name now first, then its former ones.
+    private func toolNames(_ name: String) -> [String] {
+        let tool = aliases[name] ?? name
+        return [tool] + aliases.filter { $0.value == tool }.map { $0.key }.sorted()
     }
 
     /// peerTools lists the named tools a device announced in its hello, sorted by name.
@@ -531,6 +569,32 @@ public final class Node {
         return onLoop { peers[peer]?.named[name]?.number }
     }
 
+    /// peerHasTool reports whether a device announced the tool in its last hello: a tool of the spec in its
+    /// {tool: version}, a named one in its named map. false before its hello.
+    public func peerHasTool(_ peer: String, _ name: String) -> Bool { onLoop { peerHas(peer, name) } }
+
+    private func peerHas(_ peer: String, _ name: String) -> Bool {
+        guard let ps = peers[peer] else { return false }
+        if let num = FIXED_TOOLS[name] { return ps.fixed?[num] != nil }
+        return ps.named[name] != nil
+    }
+
+    /// resolveTool is the number to call a tool on a device by, and the name it goes under there: the name
+    /// itself if the device announced it, else an alias of it (aliasTool) the device announced — a device that
+    /// knows the tool only by its former name — else, for a tool of the spec, its fixed number (no hello yet, or
+    /// the device does not list the tool). nil — a named tool the device has not announced under any name.
+    public func resolveTool(_ peer: String, _ name: String) -> (number: Int, called: String)? {
+        onLoop {
+            var names = toolNames(name)
+            if names[0] != name { names = [name] + names.filter { $0 != name } } // asked by an alias: it first
+            for nm in names where peerHas(peer, nm) {
+                if let n = FIXED_TOOLS[nm] ?? peers[peer]?.named[nm]?.number { return (n, nm) }
+            }
+            if let n = FIXED_TOOLS[name] { return (n, name) }
+            return nil
+        }
+    }
+
     /// peerToolName is the name of a tool of a device by the number it announced (nil — unnamed).
     public func peerToolName(_ peer: String, _ tool: Int) -> String? {
         if let e = FIXED_TOOLS.first(where: { $0.value == tool }) { return e.key }
@@ -539,7 +603,7 @@ public final class Node {
 
     /// callTool is call by tool name: the number is the device's own.
     public func callToolOn(_ peer: String, stream: Int64 = 0, _ name: String, _ method: Int, _ args: [Cbor.Value] = [], timeoutMs: Int64 = 0) -> Future<[Cbor.Value]> {
-        guard let num = toolNumber(peer, name) else {
+        guard let num = resolveTool(peer, name)?.number else {
             let f = Future<[Cbor.Value]>()
             f.fail(P2pactError(Errors.noMethod, "the device has no tool \(name)"))
             return f
@@ -711,7 +775,7 @@ public final class Node {
         try onLoopThrowing {
             guard let ps = peerState(peer) else { throw P2pactError(Errors.notFound, "unknown device") }
             // a tool's events go only to devices with at least read on it (spec §8.1)
-            if tool != 0 && grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?? "") < LEVEL_READ { return }
+            if tool != 0 && levelIn(trust.get(peer)?.grants, toolNameOf(tool) ?? "") < LEVEL_READ { return }
             push(ps, msg, stream, tool != 0)
         }
     }
@@ -1111,7 +1175,7 @@ public final class Node {
             var level = 0
             var forbidden = false
             if tool != 0 { // grants (spec §8.1): tool 0 is always allowed
-                level = grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?? "")
+                level = levelIn(trust.get(peer)?.grants, toolNameOf(tool) ?? "")
                 forbidden = level < requiredLevel(tool, method)
             }
             let lh = levelHandlers[MKey(tool: tool, method: method)]
@@ -1193,6 +1257,7 @@ public final class Node {
                 helloHints(Clock.nanos(), peer, ps, name: a[3].asString ?? "", os: a[4].asString ?? "", Hints.fromWire(a[8]))
                 if a.count >= 10, let k = a[9].asInt { trust.setKind(peer, k) }
                 ps.named = a.count >= 11 ? parseNamed(a[10]) : [:]
+                ps.fixed = parseFixed(a[6])
                 ps.dicts = idsOf(a[7])
                 ps.lacks = []
                 ps.tried = []
@@ -1231,6 +1296,15 @@ public final class Node {
             enqueue(ps, stream) { cb(peer, tool, ev, args) }
         default: break
         }
+    }
+
+    /// parseFixed reads the hello's {tool: version}; a malformed entry is skipped.
+    private func parseFixed(_ v: Cbor.Value) -> [Int: Int] {
+        var out: [Int: Int] = [:]
+        for e in v.asMap ?? [] {
+            if let n = e.key.asInt, let ver = e.value.asInt { out[n] = ver }
+        }
+        return out
     }
 
     /// parseNamed reads the hello's {name: [tool, version]}; a malformed entry is skipped.

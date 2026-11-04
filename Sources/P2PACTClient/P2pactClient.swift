@@ -6,6 +6,10 @@ public enum Tools {
     public static let chat = "p2pact.chat"
     public static let fleet = "p2pact.fleet"
     public static let plugins = "p2pact.plugins"
+    /// The terminal (tool 5, spec term.md); the SDK has no typed client for it: call it with `Computer.callTool`.
+    /// A computer that knows it by a former name still answers once the alias is declared:
+    /// `client.node.aliasTool(former, Tools.term)`.
+    public static let term = "p2pact.term"
 
     static let chatNumber = 1
     static let fleetNumber = 2
@@ -237,7 +241,7 @@ public final class Computer {
     public var grants: [Grant] { node.grantedBy(id) ?? defaultGrants() }
 
     /// The level we have on a tool of the computer: 0 none, 1 `LEVEL_READ`, 2 `LEVEL_WRITE`.
-    public func level(_ tool: String) -> Int { grantLevel(grants, tool) }
+    public func level(_ tool: String) -> Int { node.levelIn(grants, tool) }
     public func canRead(_ tool: String) -> Bool { level(tool) >= LEVEL_READ }
     public func canWrite(_ tool: String) -> Bool { level(tool) >= LEVEL_WRITE }
 
@@ -307,7 +311,7 @@ public final class Computer {
     public func callToolRaw(_ name: String, method: Int, args: [Cbor.Value] = [], timeout: TimeInterval? = nil) async throws -> [Cbor.Value] {
         let ms = timeout.map { Int64($0 * 1000) } ?? callTimeoutMs
         let h = lock.locked { hasHello }
-        if toolNumber(name) == nil && !h {
+        if !node.peerHasTool(id, name) && !h {
             // the hello may still be on its way after pairing
             let limit = ms > 0 ? Double(ms) / 1000 : 10
             let gate = Future<Void>()
@@ -315,7 +319,7 @@ public final class Computer {
             DispatchQueue.global().asyncAfter(deadline: .now() + limit) { gate.complete(()) }
             try await gate.value()
         }
-        guard toolNumber(name) != nil else { throw P2pactCallError.noMethod("the computer has no tool \(name)") }
+        guard node.resolveTool(id, name) != nil else { throw P2pactCallError.noMethod("the computer has no tool \(name)") }
         return try await node.callToolOn(id, name, method, args, timeoutMs: ms).value()
     }
 }

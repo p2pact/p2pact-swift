@@ -74,8 +74,12 @@ func grantsFromJson(_ v: Any?) -> [Grant]? {
 
 /// Tools given by the spec: the same number on every device. Their names are what grants are written in.
 let FIXED_TOOLS: [String: Int] = [
-    "p2pact.service": 0, "p2pact.chat": 1, "p2pact.fleet": 2, "p2pact.family": 3, "p2pact.plugins": 4
+    "p2pact.service": 0, "p2pact.chat": 1, "p2pact.fleet": 2, "p2pact.family": 3, "p2pact.plugins": 4, "p2pact.term": 5
 ]
+
+/// fixedTool is the number the spec gives a tool name (§8): 0–63, the same on every device. nil — the name is
+/// not one of the spec's.
+public func fixedTool(_ name: String) -> Int? { FIXED_TOOLS[name] }
 
 /// FIRST_NAMED_TOOL is the first number a device may choose for a named tool (spec §8).
 public let FIRST_NAMED_TOOL = 64
