@@ -15,6 +15,11 @@ let ZIP_FAST_FROM = 32 << 10
 let ZIP_QUICK_BELOW = 1 << 10
 /// DICT_KEEP is how many dictionaries of one kind to keep.
 let DICT_KEEP = 4
+/// DICT_LISTED_MAX bounds the pair's dictionaries kept because the device still lists them: what a device may
+/// list to another (its common ones, its own for it and the one it got from it). Everything we fetch from a
+/// device is the pair's here, so its list can hold more than DICT_KEEP of that kind; evicting one it lists
+/// would only make us fetch it again, and again (spec §5).
+let DICT_LISTED_MAX = 3 * DICT_KEEP
 /// SLOTS_MAX: past this many slots, a new dictionary takes the oldest empty one.
 let SLOTS_MAX = 32
 
@@ -150,7 +155,7 @@ func decompress(_ b: Bytes, _ d: Dict?) throws -> Bytes {
     if b.count < 2 { throw CompressError("short") }
     guard let frame = restoreFrame(b, 1, d?.zid ?? 0) else { throw CompressError("bad frame") }
     guard let ctx = codecs().dec else { throw CompressError("no context") }
-    var dd: OpaquePointer? = nil
+    var dd: OpaquePointer?
     if let d = d {
         dd = d.decoder()
         if dd == nil { throw CompressError("bad dictionary") }

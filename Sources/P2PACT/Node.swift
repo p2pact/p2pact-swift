@@ -169,7 +169,8 @@ public final class Node {
     public var onGranted: ((_ peer: String, _ grants: [Grant]) -> Void)?
     /// onHello is called when a known device sends its hello.
     public var onHello: ((String) -> Void)?
-    /// onHeld is called when messages from a device waited too long for a dictionary or its list and were dropped.
+    /// onHeld is called when messages from a device waited too long for a dictionary or its list, or were compressed
+    /// with a dictionary the sender has dropped since, and were dropped.
     public var onHeld: ((_ peer: String, _ held: Int) -> Void)?
     /// allowDict decides whether a known device may fetch a dictionary (0.5); nil — all may.
     public var allowDict: ((_ peer: String, _ id: Bytes) -> Bool)?
@@ -230,6 +231,10 @@ public final class Node {
         id = try Identity.load(dir: dir)
         trust = Trust(dir: dir)
         dicts = DictStore(dir: dir, io: io)
+        dicts.listedBy = { [unowned self] d in // on the node's queue, as every change of the store
+            guard let ps = self.peers[d.peer] else { return false }
+            return hasId(ps.dicts, d.id)
+        }
         loop.setSpecific(key: nodeKey, value: ())
         try? dicts.add(Dict(CommonDict.raw)) // the common dictionary, newest unless a later one was added
         handle(0, 1) { _, _ in .values([]) } // ping
@@ -1432,10 +1437,11 @@ public final class Node {
             case .missing:
                 let did = ps.dicts[Int(w.msg[0]) - 1]
                 if !did.isEmpty {
-                    fetchDict(peer, ps, did, true)
+                    if !hasId(ps.tried, did) { fetchDict(peer, ps, did) } // one we could not get: unhold asks again, then drops
                     return
                 }
-                ps.waiting.removeFirst() // a free slot: the message is damaged
+                ps.waiting.removeFirst() // a free slot: the sender dropped that dictionary, the message cannot be read
+                if let cb = onHeld { io.async { cb(peer, 1) } }
             case .noList:
                 askInfo(peer, ps)
                 return // wait for a hello or 0.5, and ask for it
@@ -1471,12 +1477,12 @@ public final class Node {
     /// fetchNew asks the device for the newest dictionary in its list that we lack: so it can compress with it.
     private func fetchNew(_ peer: String, _ ps: PeerState) {
         guard let did = ps.dicts.first(where: { !$0.isEmpty && dicts.get($0, peer) == nil && !hasId(ps.tried, $0) }) else { return }
-        fetchDict(peer, ps, did, false)
+        fetchDict(peer, ps, did)
     }
 
     /// fetchDict asks the device for dictionary id (0.5 dict): one it compressed a waiting message with, or a new
     /// one in its list. What we get belongs to the pair with it.
-    private func fetchDict(_ peer: String, _ ps: PeerState, _ did: Bytes, _ waiting: Bool) {
+    private func fetchDict(_ peer: String, _ ps: PeerState, _ did: Bytes) {
         if ps.fetching { return }
         ps.fetching = true
         func attempt(_ tryN: Int) {
@@ -1494,10 +1500,9 @@ public final class Node {
                     ps.fetching = false
                     if self.closed || self.peers[peer] !== ps { return } // forgotten meanwhile
                     if let x = d, !self.addDictLocal(x) { d = nil } // could not store it: do not ask again and again
-                    if d == nil {
-                        if waiting && !ps.waiting.isEmpty { ps.waiting.removeFirst() } // unreachable: this message is lost
-                        else { ps.tried.append(did) }
-                    }
+                    // not dropped at once even if a message waits for it: it stays held, unhold asks again
+                    // after holdAsk and drops it after holdDrop, telling the application (onHeld)
+                    if d == nil { ps.tried.append(did) }
                     self.drain(peer, ps)
                     self.fetchNew(peer, ps)
                 }
@@ -1536,6 +1541,21 @@ public final class Node {
         wake()
         return true
     }
+
+    /// addDictForTest stores a dictionary as the node would (a pair's one too) and announces it (tests).
+    func addDictForTest(_ d: Dict) { _ = onLoop { addDictLocal(d) } }
+
+    /// dictHandlerForTest serves 0.5 dict as the node does (tests wrap it to count requests).
+    func dictHandlerForTest(_ peer: String, _ args: [Cbor.Value]) throws -> [Cbor.Value] { try dictHandler(peer, args) }
+
+    /// heldForTest is how many messages from peer wait for a dictionary or its list (tests).
+    func heldForTest(_ peer: String) -> Int { onLoop { peers[peer]?.waiting.count ?? 0 } }
+
+    /// dictIdsForTest lists the dictionary ids peer sees, by slot (tests).
+    func dictIdsForTest(_ peer: String) -> [Bytes] { onLoop { dicts.ids(peer) } }
+
+    /// loseDictsForTest forgets every dictionary we have (tests).
+    func loseDictsForTest() { onLoop { dicts.clearForTest() } }
 
     /// dictState tells what compresses messages to peer.
     public func dictState(_ peer: String) -> DictState {

@@ -13,6 +13,9 @@ final class DictStore {
     private var slots: [String: [Bytes]] = [:]
     private var gen = 0
     private var cache: [String: (Int, [Bytes])] = [:]
+    /// listedBy tells whether the device a pair's dictionary came from still lists it to us (nil — none is):
+    /// such a one is kept past DICT_KEEP, up to DICT_LISTED_MAX.
+    var listedBy: ((Dict) -> Bool)?
 
     init(dir: String, io: DispatchQueue) {
         self.dir = (dir as NSString).appendingPathComponent("net-dicts")
@@ -52,9 +55,13 @@ final class DictStore {
         kinds[key(d)] = 1
         for x in dicts {
             if same(x.id, d.id) && x.peer == d.peer { continue }
-            let n = (kinds[key(x)] ?? 0) + 1
-            kinds[key(x)] = n
-            if n > DICT_KEEP { dropped.append(x) } else { out.append(x) }
+            let kept = kinds[key(x)] ?? 0
+            if kept >= DICT_KEEP && !(kept < DICT_LISTED_MAX && !x.peer.isEmpty && !x.own && (listedBy?(x) ?? false)) {
+                dropped.append(x)
+                continue
+            }
+            kinds[key(x)] = kept + 1
+            out.append(x)
         }
         for x in dropped where !out.contains(where: { same($0.id, x.id) }) {
             let p = dir + "/" + x.id.hex()
@@ -63,6 +70,12 @@ final class DictStore {
         dicts = out
         gen += 1
         saveOrder()
+    }
+
+    /// clearForTest forgets every dictionary (tests).
+    func clearForTest() {
+        dicts = []
+        gen += 1
     }
 
     private func saveOrder() {
