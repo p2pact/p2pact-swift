@@ -12,6 +12,13 @@ var keepaliveGap = 25 * SEC
 /// probeEvery: how often the direct roads are tried while a session runs over a relay or an application road.
 var probeEvery = 30 * SEC
 
+/// observeEvery: how often we ask our relay which address our UDP packets come from (NAT hole punching).
+var observeEvery = 25 * SEC
+
+/// A punch burst sends a keepalive to every UDP address of the device every punchEvery, for punchFor.
+var punchEvery = 200 * MS
+var punchFor = 3 * SEC
+
 /// Held messages (spec §5): ask again after holdAsk, drop after holdDrop; tests shorten them.
 var holdAsk = 15 * SEC
 var holdDrop = 120 * SEC
@@ -111,6 +118,8 @@ private final class PeerState {
     var heard = false // it knows our boot id: sent us session data or answered our handshake
     var lastInit: Int64 = 0
     var lastProbe: Int64 = 0
+    var burstUntil: Int64 = 0 // a punch burst runs until then (0 — none)
+    var burstNext: Int64 = 0
     var calls: [Int64: Future<[Cbor.Value]>] = [:]
     var callID: Int64 = 0
     var dicts: [Bytes] = [] // its dictionaries (ids), by slot — from its hello and 0.5
@@ -198,6 +207,9 @@ public final class Node {
     private var advertise: Hints?
     private var hintsSent: Bytes? // our addresses as last announced (reannounce)
     private var hintsAt: Int64 = 0
+    private var reflexive: String? // our address as the relay sees it (observe), part of our UDP hints
+    private var observeAt: Int64 = 0 // when the last observe went out (0 — none yet)
+    private var observeNonces: [Bytes] = [] // outstanding requests to the relay, newest last
 
     private var sessions: [Int64: Session] = [:] // by our index
     private var current: [String: Session] = [:] // the best session with a device
@@ -277,7 +289,10 @@ public final class Node {
     /// listenUdp opens the main road on an address ("0.0.0.0:48730", "127.0.0.1:0").
     public func listenUdp(_ addr: String) throws {
         let u = try UdpRoad(bind: addr) { [weak self] p, e in self?.receiveFromRoad(p, e) }
-        onLoop { udp = u }
+        onLoop {
+            udp = u
+            observeNow(Clock.nanos())
+        }
     }
 
     /// listenTcp opens the fallback road; "" — dial only.
@@ -331,7 +346,17 @@ public final class Node {
     }
 
     /// setRelay sets our relay: used for pairing and pair channels.
-    public func setRelay(_ h: RelayHint?) { onLoop { ownRelay = h } }
+    public func setRelay(_ h: RelayHint?) {
+        onLoop {
+            if ownRelay?.addr != h?.addr { // another relay sees another address
+                reflexive = nil
+                observeNonces = []
+                observeAt = 0
+            }
+            ownRelay = h
+            observeNow(Clock.nanos())
+        }
+    }
 
     /// setRelayWS tells the WebSocket URLs of our relay (the one given to setRelay, as browsers dial it): they go into
     /// our invites and hellos. This library does not dial them.
@@ -388,9 +413,13 @@ public final class Node {
         if on {
             for r in relays.values { r.close() }
             for a in apps { a.drop() }
+            for ps in peers.values { ps.burstUntil = 0 } // no bursts while paused
+            observeNonces = []
             return
         }
         let now = Clock.nanos()
+        observeAt = 0
+        observeNow(now)
         if let h = ownRelay { for k in invites.keys { relay(h).join(k, "a") } }
         for p in trust.list() {
             joinPair(p)
@@ -697,12 +726,94 @@ public final class Node {
     }
 
     private func hints() -> Hints {
+        var h = baseHints()
+        // the address the relay saw us from (a NAT's outside address); local addresses stay
+        if let r = reflexive, ownRelay != nil, !h.udp.contains(r) { h.udp.append(r) }
+        return h
+    }
+
+    private func baseHints() -> Hints {
         if var a = advertise {
             if a.relay == nil, let r = ownRelay { a.relay = r }
             if a.ws.isEmpty { a.ws = ownWS }
             return a
         }
         return Hints(udp: udp?.localAddrs() ?? [], tcp: tcp?.localAddrs() ?? [], relay: ownRelay, ws: ownWS)
+    }
+
+    // --- NAT hole punching ---
+
+    /// observeNow asks the relay which address our UDP packets come from (every observeEvery, or at once with
+    /// observeAt = 0). An old relay never answers: harmless.
+    private func observeNow(_ now: Int64) {
+        guard !paused, !closed, let u = udp, let h = ownRelay else { return }
+        if observeAt != 0 && now - observeAt < observeEvery { return }
+        observeAt = now
+        let nonce = randomBytes(16)
+        observeNonces.append(nonce)
+        if observeNonces.count > 4 { observeNonces.removeFirst() }
+        _ = u.send(h.addr, encodeObserve(nonce: nonce))
+    }
+
+    /// onObserve takes the relay's reply: it must come from the relay's address, over our UDP road, with the nonce
+    /// of a request of ours.
+    private func onObserve(_ now: Int64, _ pkt: Bytes, _ from: Endpoint) {
+        guard let u = udp, from.road === u, let h = ownRelay, let r = decodeObserve(pkt),
+              let i = observeNonces.firstIndex(of: r.nonce), u.resolvedText(h.addr) == from.addr else { return }
+        observeNonces.remove(at: i) // answered once
+        learnReflexive(now, r.addr)
+    }
+
+    private func learnReflexive(_ now: Int64, _ addr: String) {
+        if reflexive == addr { return }
+        reflexive = addr // replaces the old one
+        hintsAt = 0
+        reannounce(now) // the hello carries it
+        for (peer, ps) in peers where !onDirect(peer, ps, now) { startBurst(now, ps) }
+    }
+
+    /// onDirect: the session with the device runs over a live UDP or TCP road.
+    private func onDirect(_ peer: String, _ ps: PeerState, _ now: Int64) -> Bool {
+        guard current[peer] != nil else { return false }
+        let c = candidates(peer, ps, now, false)
+        return c.count == 1 && now - c[0].lastRecv <= ALIVE_FOR && roadRank(c[0].ep.road) < 2
+    }
+
+    private func startBurst(_ now: Int64, _ ps: PeerState) {
+        if paused || closed { return }
+        ps.burstUntil = now + punchFor
+        ps.burstNext = 0
+    }
+
+    /// punchTick sends the keepalives of the bursts that run: a packet from each side to the other's outside address
+    /// makes both NATs let the answer in.
+    private func punchTick(_ now: Int64) {
+        for (peer, ps) in peers where ps.burstUntil != 0 {
+            if now >= ps.burstUntil || onDirect(peer, ps, now) { ps.burstUntil = 0; continue }
+            if now < ps.burstNext { continue }
+            ps.burstNext = now + punchEvery
+            guard let s = current[peer], let u = udp, let p = trust.get(peer), p.kind != Kind.plugin else { continue }
+            for a in p.hints.udp { sealTo(s, epState(ps, Endpoint(road: u, addr: a)), now, keepalive()) }
+        }
+    }
+
+    private func epState(_ ps: PeerState, _ ep: Endpoint) -> EpState {
+        if let x = ps.eps[ep.key] { return x }
+        let e = EpState(ep)
+        ps.eps[ep.key] = e
+        return e
+    }
+
+    /// sessionUp: a session started over a relay or an application road — punch at once.
+    private func sessionUp(_ now: Int64, _ ps: PeerState, _ from: Endpoint) {
+        if roadRank(from.road) >= 2 { startBurst(now, ps) }
+    }
+
+    /// helloHints stores the hints of a hello; changed UDP addresses of a device not on a direct road start a burst.
+    private func helloHints(_ now: Int64, _ peer: String, _ ps: PeerState, name: String, os: String, _ h: Hints) {
+        let before = trust.get(peer)?.hints.udp
+        trust.setHints(peer, name: name, os: os, h)
+        if let after = trust.get(peer)?.hints.udp, after != before, !onDirect(peer, ps, now) { startBurst(now, ps) }
     }
 
     // --- receiving ---
@@ -718,6 +829,7 @@ public final class Node {
         case P_PAIR1: onPair1(now, pkt, from)
         case P_PAIR2: onPair2(now, pkt, from)
         case P_PAIR3: onPair3(now, pkt, from)
+        case P_OBSERVE: onObserve(now, pkt, from)
         case P_RESET:
             let idx = u32(pkt, 1)
             for s in Array(sessions.values) where s.remote == idx {
@@ -783,6 +895,7 @@ public final class Node {
         handshakeCount += 1
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 8))
+        sessionUp(now, ps, from)
         _ = from.road.send(from.addr, cat([UInt8(P_RESP)], be32(s.remote), be32(local), resp))
         // data in the first packet; from a device that has not heard our boot id it may be
         // numbered for our previous boot, to be renumbered once it gets our reply: drop it
@@ -807,6 +920,7 @@ public final class Node {
         ps.heard = true
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 0))
+        sessionUp(now, ps, from)
         sendInfo(h.peer)
         for (p, f) in h.early { onData(now, p, f) }
     }
@@ -852,6 +966,7 @@ public final class Node {
         guard let ps = peerState(peer) else { return }
         seen(ps, from, now, s.local)
         bootOf(ps, pp.boot)
+        sessionUp(now, ps, from)
         _ = from.road.send(from.addr, cat([UInt8(P_PAIR3)], be32(s.remote), msg3))
         paired(trust.get(peer) ?? p)
         done.complete(trust.get(peer) ?? p)
@@ -895,6 +1010,7 @@ public final class Node {
         guard let ps = peerState(peer) else { return }
         seen(ps, from, now, s.local)
         bootOf(ps, pp.boot)
+        sessionUp(now, ps, from)
         if let ask = decide {
             let wants = cleanGrants(pp.wants ?? defaultGrants())
             let newcomer = trust.get(peer) ?? p
@@ -1029,7 +1145,7 @@ public final class Node {
             if a.count < 3 { return }
             guard let tool = a[1].asInt, let ev = a[2].asInt else { return }
             if tool == 0 && ev == 2 && a.count >= 9 { // hello: name, hints, dictionaries
-                trust.setHints(peer, name: a[3].asString ?? "", os: a[4].asString ?? "", Hints.fromWire(a[8]))
+                helloHints(Clock.nanos(), peer, ps, name: a[3].asString ?? "", os: a[4].asString ?? "", Hints.fromWire(a[8]))
                 if a.count >= 10, let k = a[9].asInt { trust.setKind(peer, k) }
                 ps.named = a.count >= 11 ? parseNamed(a[10]) : [:]
                 ps.dicts = idsOf(a[7])
@@ -1275,6 +1391,7 @@ public final class Node {
     /// pump sends what is queued and what is due for retransmission.
     private func pump(_ now: Int64) {
         if paused { return } // nothing goes, and no timer counts a try: delivery resumes where it stopped
+        punchTick(now)
         for (peer, ps) in peers {
             guard let s = current[peer] else {
                 // take a part for the first packet only when a handshake really goes out (a
@@ -1321,6 +1438,7 @@ public final class Node {
     /// maintain runs every second: connect to known devices, keep relay channels, clean up.
     private func maintain(_ now: Int64) {
         if paused { return }
+        observeNow(now)
         for p in trust.list() {
             guard let ps = peerState(p.addr) else { continue }
             joinPair(p)
@@ -1562,6 +1680,18 @@ public final class Node {
 
     /// loseDictsForTest forgets every dictionary we have (tests).
     func loseDictsForTest() { onLoop { dicts.clearForTest() } }
+
+    // --- for tests: NAT hole punching ---
+    func hintsForTest() -> Hints { onLoop { hints() } }
+    func reflexiveForTest() -> String? { onLoop { reflexive } }
+    func burstActiveForTest(_ peer: String) -> Bool { onLoop { (peers[peer]?.burstUntil ?? 0) != 0 } }
+    func burstClearForTest(_ peer: String) { onLoop { peers[peer]?.burstUntil = 0 } }
+    /// leaveDirectForTest forgets the live roads of a device: its session counts as not on a direct road.
+    func leaveDirectForTest(_ peer: String) { onLoop { peers[peer]?.eps.removeAll() } }
+    /// helloHintsForTest is a hello of the device with these hints.
+    func helloHintsForTest(_ peer: String, _ h: Hints) { onLoop { if let ps = peers[peer] { helloHints(Clock.nanos(), peer, ps, name: "", os: "", h) } } }
+    /// sessionUpForTest is a session of the device that started on this road.
+    func sessionUpForTest(_ peer: String, _ from: Endpoint) { onLoop { if let ps = peers[peer] { sessionUp(Clock.nanos(), ps, from) } } }
 
     /// dictState tells what compresses messages to peer.
     public func dictState(_ peer: String) -> DictState {

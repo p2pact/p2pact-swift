@@ -44,3 +44,36 @@ struct Window {
     private mutating func set(_ i: Int64) { bits[Int(i / 64)] |= (1 << UInt64(i % 64)) }
     private mutating func clear(_ i: Int64) { bits[Int(i / 64)] &= ~(1 << UInt64(i % 64)) }
 }
+
+// Observe (NAT hole punching): the relay tells a device the address its UDP packet came from.
+//   request  device -> relay: [8][nonce 16][zero padding 19] = 36 bytes (as long as the reply never grows past it)
+//   reply    relay -> device: [8][nonce 16][ip 16][port 2, big-endian] = 35 bytes; IPv4 as IPv4-mapped IPv6
+// UDP only, never between devices.
+let P_OBSERVE = 8
+let OBSERVE_REQUEST_SIZE = 36
+let OBSERVE_REPLY_SIZE = 35
+
+func encodeObserve(nonce: Bytes) -> Bytes {
+    var out = Bytes(repeating: 0, count: OBSERVE_REQUEST_SIZE)
+    out[0] = UInt8(P_OBSERVE)
+    for i in 0..<16 { out[1 + i] = nonce[i] }
+    return out
+}
+
+/// decodeObserve reads a reply: its nonce and the observed address as "host:port"; nil — not a valid reply.
+func decodeObserve(_ pkt: Bytes) -> (nonce: Bytes, addr: String)? {
+    if pkt.count != OBSERVE_REPLY_SIZE || Int(pkt[0]) != P_OBSERVE { return nil }
+    let ip = Bytes(pkt[17..<33])
+    let port = Int(pkt[33]) << 8 | Int(pkt[34])
+    if port == 0 || ip.allSatisfy({ $0 == 0 }) { return nil }
+    let host: String
+    if ip[0..<10].allSatisfy({ $0 == 0 }) && ip[10] == 0xff && ip[11] == 0xff {
+        host = "\(ip[12]).\(ip[13]).\(ip[14]).\(ip[15])"
+    } else {
+        var buf = [CChar](repeating: 0, count: 64)
+        let ok = ip.withUnsafeBytes { inet_ntop(AF_INET6, $0.baseAddress, &buf, 64) != nil }
+        if !ok { return nil }
+        host = String(cString: buf)
+    }
+    return (Bytes(pkt[1..<17]), joinHostPort(host, port))
+}

@@ -361,20 +361,26 @@ public final class UdpRoad: Road {
         counters.sent(pkt.count)
         if drop?() == true { return true }
         if closedFlag.value { return false }
-        lock.lock()
-        var to = addrs[addr]
-        lock.unlock()
-        if to == nil {
-            guard let (h, p) = hostPort(addr), let r = resolve(host: h, port: p, family: family == AF_INET6 ? AF_UNSPEC : family, type: SOCK_DGRAM).first else { return false }
-            let a = family == AF_INET6 ? v4Mapped(r) : r // a dual-stack socket sends IPv4 as mapped
-            lock.lock(); addrs[addr] = a; lock.unlock()
-            to = a
-        }
+        guard let to = target(addr) else { return false }
         let r = pkt.withUnsafeBytes { b in
-            to!.with { sa, l in sendto(fd, b.baseAddress, pkt.count, 0, sa, l) }
+            to.with { sa, l in sendto(fd, b.baseAddress, pkt.count, 0, sa, l) }
         }
         return r >= 0
     }
+
+    private func target(_ addr: String) -> SockAddr? {
+        lock.lock()
+        let known = addrs[addr]
+        lock.unlock()
+        if let k = known { return k }
+        guard let (h, p) = hostPort(addr), let r = resolve(host: h, port: p, family: family == AF_INET6 ? AF_UNSPEC : family, type: SOCK_DGRAM).first else { return nil }
+        let a = family == AF_INET6 ? v4Mapped(r) : r // a dual-stack socket sends IPv4 as mapped
+        lock.lock(); addrs[addr] = a; lock.unlock()
+        return a
+    }
+
+    /// resolvedText is the numeric form of addr as a packet from it shows (the source of a reply); nil — cannot resolve.
+    func resolvedText(_ addr: String) -> String? { target(addr)?.text }
 
     private func run() {
         defer { exited.signal() }
