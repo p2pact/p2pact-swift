@@ -5,6 +5,12 @@ Swift implementation of [P2PACT](https://github.com/p2pact/p2pact) (macOS 13+, i
 - `P2PACT` library: identity, invites, pairing and known-device handshakes, sessions, delivery,
   CBOR messages, tool 0, named tools, grants and wants, UDP / TCP / relay / local-socket /
   application roads, zstd compression with dictionaries (incl. training).
+- `allowForward(a, b, on)` — opt this device in as a forwarder between two devices it trusts
+  (spec §3, via a third device): they reach each other through it when nothing else works, end
+  to end encrypted. Kept with the trusted list; `forwardRate` limits each direction (256 KB/s by
+  default). The two devices need nothing: they learn it from the hello and use the road
+  `via:<forwarder>` (`paths`), ranked with an application road. `forwards`, `forwarders` and
+  `forwardStats` tell who forwards for whom and how much.
 - `p2pact-interop`: the JSON-line peer of [p2pact-tests](https://github.com/p2pact/p2pact-tests)
   (`P2PACT_SWIFT=.build/release/p2pact-interop go test ./interop`).
 

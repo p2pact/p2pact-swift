@@ -287,6 +287,18 @@ func handle(_ req: [String: Any]) throws {
             return .values(try node.callToolOn(plugin, name, method, args, timeoutMs: 20_000).get())
         }
         say(["ok": true])
+    // via a third device (spec §3)
+    case "hide": // announce no addresses from now on: known devices reach us over roads they have, or through a forwarder
+        node.setAdvertise(Hints())
+        say(["ok": true])
+    case "forward":
+        try node.allowForward(str("a"), str("b"), req["on"] as? Bool ?? false)
+        say(["ok": true])
+    case "paths":
+        say(["paths": node.paths(str("peer"))])
+    case "forward-stats":
+        let st = node.forwardStats()
+        say(["forwarded": st.forwarded, "dropped": st.dropped])
     case "close":
         node.close()
         exit(0)

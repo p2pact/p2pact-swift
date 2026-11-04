@@ -137,6 +137,7 @@ private final class PeerState {
     var tried: [Bytes] = [] // dictionaries of its list we asked it for and did not get
     var sysCalls = Set<Int64>() // our calls of tool 0: their results are not conversation
     var inbox: [Int64: Inbox] = [:] // calls and events waiting for their turn, per stream
+    var forwards: [String] = [] // the devices it forwards to for us, from its hello (spec §3)
     init(_ addr: String) { self.addr = addr }
 
     /// initGap: retry a handshake after three measured round trips (250 ms – 2 s), else 1 s.
@@ -193,6 +194,8 @@ public final class Node {
     public var noLearning = false
     /// kind is what this device is for (Kind), told in pairing and the hello (spec §1).
     public var kind = Kind.unknown
+    /// forwardRate: bytes a second we forward in one direction of a pair we forward for (allowForward); 0 — DEFAULT_FORWARD_RATE.
+    public var forwardRate = 0
 
     private let loop = DispatchQueue(label: "p2pact-node")
     private let workers = DispatchQueue(label: "p2pact-handler", attributes: .concurrent)
@@ -241,6 +244,12 @@ public final class Node {
     private var closed = false
     private var lastTs: Int64 = 0
     private var handshakeCount = 0
+    private var vias: [String: ViaRoad] = [:] // roads through forwarders, by forwarder (spec §3)
+    private var fwdBuckets: [String: FwdBucket] = [:] // rate limit per forwarded direction ("from>to")
+    private var fwdCount: Int64 = 0
+    private var fwdDropped: Int64 = 0
+    /// forwardTap sees what we forward (tests); called on the node's queue.
+    private var forwardTap: ((_ from: String, _ to: String, _ pkt: Bytes) -> Void)?
 
     public init(dir: String, name: String, timing: LearnTiming = LearnTiming()) throws {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -641,8 +650,26 @@ public final class Node {
             learner.forget(addr)
             if let ps = peers.removeValue(forKey: addr) { for c in ps.calls.values { c.fail(P2pactError(Errors.failed, "device forgotten")) } }
             if let s = current.removeValue(forKey: addr) { sessions.removeValue(forKey: s.local) }
+            let fw = trust.get(addr)?.forward ?? [] // the devices we forwarded to it for: they learn it is withdrawn
             _ = trust.remove(addr)
+            for a in fw { hello(a) }
         }
+    }
+
+    /// befriend adds a device to the trusted list without pairing (a family member, spec/family.md; tests): its key must match
+    /// its address. A known device keeps its pair secret; a new one gets one derived from both keys.
+    func befriend(_ p0: Peer) throws {
+        if p0.kind == Kind.plugin { throw P2pactError(Errors.badArgs, "a plugin is never in the family") }
+        if p0.key.count != 32 || Crypto.address(p0.key) != p0.addr { throw P2pactError(Errors.badArgs, "key does not match address") }
+        if var old = trust.get(p0.addr) {
+            old.name = p0.name; old.signKey = p0.signKey; old.os = p0.os
+            if p0.kind != Kind.unknown { old.kind = p0.kind }
+            trust.put(old)
+            return
+        }
+        var p = p0
+        p.pairSecret = id.shared(p0.key, "family-pair")
+        trust.put(p)
     }
 
     public func peer(_ addr: String) -> Peer? { trust.get(addr) }
@@ -706,7 +733,7 @@ public final class Node {
     /// knownPeers lists the paired devices.
     public func knownPeers() -> [Peer] { trust.list() }
 
-    /// paths lists live roads to a known device: udp, tcp, relay:<address>.
+    /// paths lists live roads to a known device: udp, tcp, relay:<address>, via:<forwarder>.
     public func paths(_ peer: String) -> [String] {
         onLoop {
             guard let ps = peers[peer] else { return [] }
@@ -717,7 +744,8 @@ public final class Node {
         }
     }
 
-    /// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind, {name: [tool, version]}].
+    /// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind, {name: [tool, version]},
+    /// [forwards]]: the last one only when we forward for the device (spec §3).
     private func info(_ peer: String) -> [Cbor.Value] {
         var tools: [Int] = []
         // tools whose handlers check the caller's level are tools too
@@ -725,8 +753,11 @@ public final class Node {
         for k in levelHandlers.keys where k.tool != 0 && numbers[k.tool] == nil && !tools.contains(k.tool) { tools.append(k.tool) }
         for t in toolHandlers.keys where t != 0 && numbers[t] == nil && !tools.contains(t) { tools.append(t) }
         tools.sort()
-        return [.text(name), .text(goos()), "p2pact-swift", .map(tools.map { Cbor.MapEntry(.int(Int64($0)), .int(1)) }),
-                .array(dicts.ids(peer).map { .bytes($0) }), hints().toWire(), .int(Int64(kind)), namedTools()]
+        var out: [Cbor.Value] = [.text(name), .text(goos()), "p2pact-swift", .map(tools.map { Cbor.MapEntry(.int(Int64($0)), .int(1)) }),
+                                 .array(dicts.ids(peer).map { .bytes($0) }), hints().toWire(), .int(Int64(kind)), namedTools()]
+        let fw = forwardsOf(peer).compactMap { addrBytes($0) } // whom we forward to for it (spec §3)
+        if !fw.isEmpty { out.append(.array(fw.map { .bytes($0) })) }
+        return out
     }
 
     private func hints() -> Hints {
@@ -1167,7 +1198,16 @@ public final class Node {
                 ps.tried = []
                 fetchNew(peer, ps)
                 drain(peer, ps)
+                heardForwards(peer, ps, a.count >= 12 ? a[11] : nil)
                 if let cb = onHello { callbacks.async { cb(peer) } }
+                return
+            }
+            if tool == 0 && ev == EV_FORWARD { // carry a packet to another device (spec §3)
+                forward(peer, Array(a[3...]))
+                return
+            }
+            if tool == 0 && ev == EV_FORWARDED { // a packet another device sent us through this one
+                forwarded(peer, Array(a[3...]))
                 return
             }
             if tool == 0 && ev == 6 && a.count >= 4 { // what we may use of its tools
@@ -1278,12 +1318,18 @@ public final class Node {
         if let t = tcp { for a in p.hints.tcp { add(Endpoint(road: t, addr: a)) } }
         if let r = pairRelay(p) { add(Endpoint(road: r, addr: p.relayChannel)) }
         for a in apps where a.peer == peer { add(a.endpoint) } // a road the application opened to this device
+        // devices that forward to it for us (spec §3)
+        for (x, xs) in peers where x != peer && current[x] != nil && xs.forwards.contains(peer) { add(Endpoint(road: via(x), addr: peer)) }
+        // a road via a third device takes retransmissions only while no other road is live: every packet on it costs
+        // the forwarder (spec §7)
+        if alive.contains(where: { !($0.ep.road is ViaRoad) }) { out.removeAll { $0.ep.road is ViaRoad } }
         return out
     }
 
-    /// roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application provides.
+    /// roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application provides or a road via
+    /// a third device.
     private func roadRank(_ r: Road) -> Int {
-        if r is AttachedRoad { return 3 }
+        if r is AttachedRoad || r is ViaRoad { return 3 }
         switch r.name {
         case "udp": return 0
         case "tcp", "local": return 1
@@ -1406,6 +1452,7 @@ public final class Node {
     private func pump(_ now: Int64) {
         if paused { return } // nothing goes, and no timer counts a try: delivery resumes where it stopped
         punchTick(now)
+        fwdRelease(now)
         for (peer, ps) in peers {
             guard let s = current[peer] else {
                 // take a part for the first packet only when a handshake really goes out (a
@@ -1426,8 +1473,8 @@ public final class Node {
                 if let ar = r as? AttachedRoad {
                     ps.st.reliable = ar.config.stream
                     ps.st.link = ar.rate
-                } else {
-                    ps.st.reliable = r.name != "udp"
+                } else { // a road via a third device may drop (the forwarder's limits): a window applies, as on UDP
+                    ps.st.reliable = r.name != "udp" && !(r is ViaRoad)
                     ps.st.link = 0
                 }
             }
@@ -1482,6 +1529,176 @@ public final class Node {
             let i = u32(randomBytes(4), 0)
             if i != 0 && sessions[i] == nil && hs[i] == nil { return i }
         }
+    }
+
+    // --- via a third device (spec §3, Forward.swift) ---
+
+    private func via(_ x: String) -> ViaRoad {
+        if let v = vias[x] { return v }
+        let v = ViaRoad(x: x) { [unowned self] to, pkt in self.carry(x, to, pkt) }
+        vias[x] = v
+        return v
+    }
+
+    /// carry is ViaRoad.send: a packet for device `to` goes to forwarder x in event 0.7, on the stream of to's address.
+    private func carry(_ x: String, _ to: String, _ pkt: Bytes) -> Bool {
+        if pkt.count > MAX_ROAD_PACKET { return false }
+        guard let raw = addrBytes(to), let ps = peers[x], direct(ps, Clock.nanos()), ps.st.queue.count < FORWARD_QUEUE else { return false }
+        ps.st.push(Cbor.encode([3, 0, .int(Int64(EV_FORWARD)), .bytes(raw), .bytes(pkt)]), zip: false, stream: forwardStream(raw))
+        wake()
+        return true
+    }
+
+    /// direct: we are in session with the device and have a live road to it that is not via a third device. Forwarding
+    /// takes one hop only — no chains, no loops.
+    private func direct(_ ps: PeerState, _ now: Int64) -> Bool {
+        current[ps.addr] != nil && ps.eps.values.contains { !($0.ep.road is ViaRoad) && now - $0.lastRecv <= ALIVE_FOR }
+    }
+
+    /// allowForward opts this device in (on) or out as a forwarder between two devices it trusts (spec §3): one consent
+    /// for both directions, kept with the trusted list. Both devices learn it from our hello, sent again to them at once.
+    public func allowForward(_ a: String, _ b: String, _ on: Bool) throws {
+        if a == b || a == id.addr || b == id.addr { throw P2pactError(Errors.badArgs, "forwarding needs two other devices") }
+        try onLoopThrowing {
+            guard let pa = trust.get(a), let pb = trust.get(b) else { throw P2pactError(Errors.notFound, "unknown device") }
+            if pa.kind == Kind.plugin || pb.kind == Kind.plugin {
+                throw P2pactError(Errors.badArgs, "a plugin is reachable over the local socket only")
+            }
+            func set(_ p: Peer, _ other: String) -> Bool {
+                var list = p.forward.filter { $0 != other }
+                if on { list = (list + [other]).sorted() }
+                if list == p.forward { return false }
+                trust.setForward(p.addr, list)
+                return true
+            }
+            if set(pa, b) { hello(a) }
+            if set(pb, a) { hello(b) }
+        }
+    }
+
+    /// forwards lists the devices we forward to for a known device (allowForward).
+    public func forwards(_ peer: String) -> [String] { onLoop { forwardsOf(peer) } }
+
+    private func forwardsOf(_ peer: String) -> [String] {
+        trust.get(peer)?.forward.filter { $0 != peer && trust.get($0) != nil } ?? []
+    }
+
+    /// forwarders lists the devices that forward for us to peer: their hellos list it.
+    public func forwarders(_ peer: String) -> [String] {
+        onLoop { peers.filter { $0.key != peer && $0.value.forwards.contains(peer) }.keys.sorted() }
+    }
+
+    /// forwardStats: packets this device forwarded for others, and those it dropped.
+    public func forwardStats() -> (forwarded: Int64, dropped: Int64) { onLoop { (fwdCount, fwdDropped) } }
+
+    /// setForwardTap sees what we forward (tests).
+    func setForwardTap(_ f: ((_ from: String, _ to: String, _ pkt: Bytes) -> Void)?) { onLoop { forwardTap = f } }
+
+    /// hello sends our hello again to a device in session (what we forward for it changed).
+    private func hello(_ peer: String) {
+        if current[peer] == nil { return }
+        guard let ps = peerState(peer) else { return }
+        push(ps, Cbor.encode(.array([3, 0, 2] + info(peer))), 0, false)
+    }
+
+    /// heardForwards takes the list a device's hello gave: the devices it forwards to for us. A device newly reachable
+    /// through it gets a handshake at once.
+    private func heardForwards(_ x: String, _ ps: PeerState, _ v: Cbor.Value?) {
+        let old = ps.forwards
+        ps.forwards = (v?.asList ?? []).compactMap { $0.asBytes }.filter { $0.count == 16 }.map { addrText($0) }
+            .filter { $0 != x && $0 != id.addr } // trust is checked on use
+        let now = Clock.nanos()
+        for a in ps.forwards where !old.contains(a) && current[a] == nil {
+            guard let pa = peerState(a) else { continue }
+            pa.lastInit = 0
+            startInit(now, a, pa, pa.st.idle() ? nil : pa.st.nextPacket(now, false)?.plain)
+        }
+    }
+
+    /// forward: device from asks us to carry a packet to another device (event 0.7). Anything we may not or cannot
+    /// forward is dropped silently.
+    private func forward(_ from: String, _ args: [Cbor.Value]) {
+        guard let to = args.at(0).asBytes, let pkt = args.at(1).asBytes, to.count == 16, pkt.count >= 5, pkt.count <= MAX_ROAD_PACKET else {
+            fwdDropped += 1
+            return
+        }
+        let now = Clock.nanos()
+        let dest = addrText(to)
+        guard dest != from, dest != id.addr, let pf = trust.get(from), trust.get(dest) != nil, pf.forward.contains(dest),
+              let pd = peerState(dest), let ps = peers[from], direct(ps, now), direct(pd, now), pd.st.queue.count < FORWARD_QUEUE,
+              let src = addrBytes(from) else {
+            fwdDropped += 1
+            return
+        }
+        let msg = Cbor.encode([3, 0, .int(Int64(EV_FORWARDED)), .bytes(src), .bytes(pkt)])
+        if !fwdOffer(from + ">" + dest, FwdPending(to: dest, msg: msg, stream: forwardStream(src), size: pkt.count), now) {
+            fwdDropped += 1
+            return
+        }
+        forwardTap?(from, dest, pkt)
+    }
+
+    private func fwdRate() -> Double { Double(forwardRate > 0 ? forwardRate : DEFAULT_FORWARD_RATE) }
+
+    /// fwdOffer forwards p now, or queues it behind its direction's rate; false — dropped.
+    private func fwdOffer(_ dir: String, _ p: FwdPending, _ now: Int64) -> Bool {
+        let b: FwdBucket
+        if let x = fwdBuckets[dir] { b = x } else { b = FwdBucket(tokens: Double(FORWARD_BURST), at: now); fwdBuckets[dir] = b }
+        b.refill(now, fwdRate())
+        if b.q.isEmpty && b.tokens >= Double(p.size) {
+            b.tokens -= Double(p.size)
+            fwdSend(p)
+            return true
+        }
+        if b.queued + p.size > FORWARD_BURST { return false }
+        b.q.append(p)
+        b.queued += p.size
+        return true
+    }
+
+    /// fwdRelease forwards what waited for its direction's rate (with every pump).
+    private func fwdRelease(_ now: Int64) {
+        for (dir, b) in fwdBuckets {
+            if b.q.isEmpty {
+                if now - b.at > 60 * SEC { fwdBuckets.removeValue(forKey: dir) } // full again long ago
+                continue
+            }
+            b.refill(now, fwdRate())
+            while let p = b.q.first, b.tokens >= Double(p.size) {
+                _ = b.q.removeFirst()
+                b.queued -= p.size
+                b.tokens -= Double(p.size)
+                fwdSend(p)
+            }
+        }
+    }
+
+    private func fwdSend(_ p: FwdPending) {
+        guard let pd = peers[p.to] else { return }
+        pd.st.push(p.msg, zip: false, stream: p.stream)
+        fwdCount += 1
+        wake()
+    }
+
+    /// fwdOfferForTest offers a packet of size bytes for a known device to the shaper (tests).
+    func fwdOfferForTest(_ dir: String, _ to: String, _ size: Int, _ now: Int64) -> Bool {
+        onLoop {
+            _ = peerState(to)
+            return fwdOffer(dir, FwdPending(to: to, msg: [1], stream: 1, size: size), now)
+        }
+    }
+
+    /// fwdReleaseForTest runs the shaper as a pump at now would (tests).
+    func fwdReleaseForTest(_ now: Int64) { onLoop { fwdRelease(now) } }
+
+    /// forwarded: forwarder x hands over a packet another device sent us through it (event 0.8). It is handled as
+    /// arriving on the road via x — only from a device x told us it forwards to, and only over a road to x that is not
+    /// via a third device.
+    private func forwarded(_ x: String, _ args: [Cbor.Value]) {
+        guard let src = args.at(0).asBytes, let pkt = args.at(1).asBytes, src.count == 16, pkt.count >= 5, pkt.count <= MAX_ROAD_PACKET else { return }
+        let from = addrText(src)
+        guard from != x, from != id.addr, let xs = peers[x], xs.forwards.contains(from), trust.get(from) != nil, direct(xs, Clock.nanos()) else { return }
+        receive(pkt, Endpoint(road: via(x), addr: from))
     }
 
     // --- compression (spec §5) ---
@@ -1725,8 +1942,8 @@ func bootstrap(_ m: Bytes) -> Bool {
     m.count > 3 && m[1] == 3 && m[2] == 0 && (m[3] == 2 || m[3] == 5)
 }
 
-/// outOfOrder: results and errors of our calls, hellos and dictionary lists may skip the queue.
+/// outOfOrder: results and errors of our calls, hellos, dictionary lists and forward events (spec §3) may skip the queue.
 private func outOfOrder(_ m: Bytes) -> Bool {
     if m.count < 2 { return false }
-    return m[1] == 1 || m[1] == 2 || (m.count > 3 && m[1] == 3 && m[2] == 0 && (m[3] == 2 || m[3] == 5))
+    return m[1] == 1 || m[1] == 2 || (m.count > 3 && m[1] == 3 && m[2] == 0 && (m[3] == 2 || m[3] == 5)) || forwardMsg(m)
 }

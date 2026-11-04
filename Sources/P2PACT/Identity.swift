@@ -216,12 +216,16 @@ public struct Peer {
     public var granted: [Grant]?
     /// We reach the device over our local socket (a plugin's host, spec §3).
     public var local = false
+    /// The devices we forward to for this one (spec §3, Node.allowForward); the consent is for the pair, so each of the
+    /// two lists the other.
+    public var forward: [String] = []
 
     init(addr: String, key: Bytes, name: String, pairSecret: Bytes, hints: Hints, added: Int64 = 0, signKey: Bytes? = nil,
-         os: String? = nil, via: String? = nil, kind: Int = Kind.unknown, grants: [Grant]? = nil, granted: [Grant]? = nil, local: Bool = false) {
+         os: String? = nil, via: String? = nil, kind: Int = Kind.unknown, grants: [Grant]? = nil, granted: [Grant]? = nil, local: Bool = false,
+         forward: [String] = []) {
         self.addr = addr; self.key = key; self.name = name; self.pairSecret = pairSecret; self.hints = hints; self.added = added
         self.signKey = signKey; self.os = os; self.via = via; self.kind = kind; self.grants = grants; self.granted = granted
-        self.local = local
+        self.local = local; self.forward = forward
     }
 
     /// relayChannel is the pair's relay channel: only these two devices know it (spec §3).
@@ -251,7 +255,8 @@ final class Trust {
                          hints: Hints.fromJson(m["hints"]), added: (m["added"] as? NSNumber)?.int64Value ?? 0,
                          signKey: unb64(m["sign_key"] as? String), os: m["os"] as? String, via: m["via"] as? String,
                          kind: (m["kind"] as? NSNumber)?.intValue ?? 0, grants: grantsFromJson(m["grants"]),
-                         granted: grantsFromJson(m["granted"]), local: (m["local"] as? Bool) ?? false)
+                         granted: grantsFromJson(m["granted"]), local: (m["local"] as? Bool) ?? false,
+                         forward: (m["forward"] as? [Any])?.compactMap { $0 as? String } ?? [])
             if p.key.count == 32 && Crypto.address(p.key) == p.addr { peers[p.addr] = p }
         }
     }
@@ -311,8 +316,22 @@ final class Trust {
     func remove(_ addr: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if peers.removeValue(forKey: addr) == nil { return false }
+        for (k, p) in peers where p.forward.contains(addr) { // forgetting a device withdraws forwarding to it
+            var q = p
+            q.forward.removeAll { $0 == addr }
+            peers[k] = q
+        }
         save()
         return true
+    }
+
+    /// setForward stores the devices we forward to for a known device.
+    func setForward(_ addr: String, _ list: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        guard var p = peers[addr] else { return }
+        p.forward = list
+        peers[addr] = p
+        save()
     }
 
     private func save() {
@@ -326,6 +345,7 @@ final class Trust {
             m["grants"] = p.grants.map { grantsToJson($0) } ?? NSNull()
             if let g = p.granted { m["granted"] = grantsToJson(g) }
             if p.local { m["local"] = true }
+            if !p.forward.isEmpty { m["forward"] = p.forward }
             return m
         }
         guard let b = try? JSONSerialization.data(withJSONObject: list, options: [.prettyPrinted, .sortedKeys]) else { return }
