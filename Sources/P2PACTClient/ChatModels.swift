@@ -29,6 +29,8 @@ public struct InitializeResult: Equatable {
     public let agents: [AgentInfo]
     /// The computer speaks the `_p2pact/<name>` extensions.
     public let extensions: Bool
+    /// The result version the engine answers with (`_meta.p2pact.v`); 2 or more: typed, complete results. 1 for an older engine.
+    public let resultVersion: Int
     public let raw: JSONValue
 
     public init(_ m: JSONValue) {
@@ -41,6 +43,7 @@ public struct InitializeResult: Equatable {
         loadSession = m.obj("agentCapabilities")?.bool("loadSession") ?? false
         agents = meta.objs("agents").map(AgentInfo.init)
         extensions = (meta.int("ext") ?? 0) >= 1
+        resultVersion = meta.int("v") ?? 1
         raw = m
     }
 }
@@ -213,6 +216,8 @@ public struct OlderPage {
     public let sessionId: String
     public let messages: [ChatMessage]
     public let more: Bool
+    /// The run the messages belong to, when the computer says.
+    public let run: String?
     public let raw: JSONValue
 }
 
@@ -233,6 +238,8 @@ public struct DiffResult {
 }
 
 public struct ImageResult {
+    public let path: String?
+    public let mime: String?
     /// Base64.
     public let data: String?
     /// `not_found`, `no_file`, `too_big`, `bad_image`.
@@ -327,3 +334,93 @@ public typealias PermissionHandler = (PermissionRequest) async throws -> Permiss
 /// The application's answer to questions: {question text → label} (see `QuestionRequest.join`);
 /// a throw answers with an error (the question stays open on the computer).
 public typealias QuestionHandler = (QuestionRequest) async throws -> [String: String]
+
+// --- typed results of the `_p2pact/*` methods (chat spec §10) ---
+
+/// An argument hint of a slash command.
+public struct CommandArg: Equatable {
+    public let value: String
+    public let desc: String?
+}
+
+/// A slash command of a chat (`_p2pact/commands`).
+public struct ChatCommand: Equatable {
+    public let name: String
+    public let desc: String?
+    public let hint: String?
+    public let args: [CommandArg]
+    public let raw: JSONValue
+}
+
+/// `_p2pact/files`: paths of the chat's folder that match `query`.
+public struct FilesResult {
+    public let files: [String]
+    public let query: String
+    public let raw: JSONValue
+}
+
+/// A past conversation of the computer's agents (`_p2pact/history`).
+public struct HistoryItem: Equatable {
+    public let id: String
+    public let agent: String?
+    public let dir: String?
+    public let title: String?
+    /// Unix milliseconds.
+    public let updated: Int64?
+    public let count: Int?
+    public let raw: JSONValue
+}
+
+/// One page of `_p2pact/history`.
+public struct HistoryPage {
+    public let items: [HistoryItem]
+    public let query: String
+    public let from: Int
+    public let total: Int
+    /// The `offset` of the next page, when there is one.
+    public let cursor: Int?
+    /// The list is not complete yet (an older engine, or the engine still reading).
+    public let partial: Bool
+    public let raw: JSONValue
+}
+
+/// `_p2pact/projects`: the folders the computer works in.
+public struct ProjectsResult {
+    public let dirs: [String]
+    public let projectDirs: [String: [String]]
+    public let dirRepos: [String: String]
+    public let raw: JSONValue
+}
+
+/// An agent the computer can start (`_p2pact/agents`).
+public struct ChatAgent: Equatable {
+    public let id: String
+    public let name: String
+    public let type: String?
+    public let enabled: Bool
+    public let models: [String]
+    public let defaultModel: String?
+    public let raw: JSONValue
+}
+
+/// A preset of an agent and model (`_p2pact/agents`).
+public struct AgentPreset: Equatable {
+    public let id: String
+    public let name: String
+    public let raw: JSONValue
+}
+
+public struct AgentsResult {
+    public let agents: [ChatAgent]
+    public let presets: [AgentPreset]
+    public let raw: JSONValue
+}
+
+/// The answer of `close`, `restart`, `hide` and `historyOpen`: `ok`, or the `error` text.
+public struct ActionResult: Equatable {
+    public let ok: Bool
+    public let error: String?
+    /// The lines of the answer (§9.3), kept for apps that read them.
+    public let lines: [JSONValue]
+    public let raw: JSONValue
+}

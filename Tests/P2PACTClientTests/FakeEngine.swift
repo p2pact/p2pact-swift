@@ -130,7 +130,19 @@ final class FakeEngine {
             default: resp = plugins(method, params)
             }
         }
-        return .values([cborFromJSON(resp)])
+        return .values([cborFromJSON(tool == 1 && legacy ? Self.stripTyped(method, resp) : resp)])
+    }
+
+    /// An engine older than result version 2: the `_p2pact/*` results hold only `lines`.
+    var legacy: Bool {
+        get { lock.locked { _legacy } }
+        set { lock.locked { _legacy = newValue } }
+    }
+    private var _legacy = false
+
+    static func stripTyped(_ method: String, _ resp: JSONValue) -> JSONValue {
+        guard method.hasPrefix("_p2pact/"), let result = resp.obj("result"), let lines = result["lines"] else { return resp }
+        return ["jsonrpc": "2.0", "result": ["lines": lines]]
     }
 
     private func chat(_ method: String, _ params: JSONValue) -> JSONValue {

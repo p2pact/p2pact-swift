@@ -18,7 +18,7 @@ final class EngineE2ETests: XCTestCase {
             log = dir + "/engine.log"
             FileManager.default.createFile(atPath: log, contents: nil)
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            proc.arguments = ["go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./cmd/nomadcode"]
+            proc.arguments = ["go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./engine"]
             proc.currentDirectoryURL = URL(fileURLWithPath: agent)
             var env = ProcessInfo.processInfo.environment
             env["NOMAD_APP_E2E"] = dir
@@ -106,6 +106,16 @@ final class EngineE2ETests: XCTestCase {
             }
         }
         XCTAssertTrue(texts.contains("u:привет") && texts.contains("a:Готово"), "\(texts)")
+
+        XCTAssertGreaterThanOrEqual(info.resultVersion, 2, "the engine must answer with the result version")
+        // typed results of the extensions
+        let agents = try await chat.agents()
+        XCTAssertFalse(agents.agents.isEmpty, "typed agents")
+        XCTAssertFalse(agents.agents[0].id.isEmpty)
+        let projects = try await chat.projects()
+        XCTAssertNotNil(projects.raw.obj("lines") ?? projects.raw["dirs"])
+        let hist = try await chat.history()
+        XCTAssertEqual(hist.items.count <= hist.total || hist.total == 0, true)
 
         // fleet: read
         let fleet = computer.fleet

@@ -71,7 +71,7 @@ public final class ChatClient {
         let params: JSONValue = [
             "protocolVersion": 1,
             "clientCapabilities": [:],
-            "_meta": ["p2pact": ["ext": 1]]
+            "_meta": ["p2pact": ["ext": 1, "v": 2]]
         ]
         let f = Future<InitializeResult>()
         lock.locked { initialized = f }
@@ -210,44 +210,126 @@ public final class ChatClient {
         try await settledCall("_p2pact/\(name)", params, stream: streamOf(params.str("sessionId"))).objs("lines")
     }
 
+    /// The whole `result` of `_p2pact/<name>`, and where its content is: the result itself when it has one of the
+    /// typed `keys` (an engine of result version 2), else the line `cmd == name` of `lines` (an older engine; the
+    /// line may also be missing: then `{}`). Content that an older engine sends late (`commands`, `agents`,
+    /// `history`) is not in the result there: it comes in `reports`, and the typed result is empty (not waited for).
+    private func extCall(_ name: String, _ params: JSONValue, keys: [String]) async throws -> (src: JSONValue, lines: [JSONValue]) {
+        let r = try await settledCall("_p2pact/\(name)", params, stream: streamOf(params.str("sessionId")))
+        let lines = r.objs("lines")
+        if keys.contains(where: { r[$0] != nil }) { return (r, lines) }
+        return (lines.first { $0.str("cmd") == name } ?? .object([:]), lines)
+    }
+
+    private func action(_ name: String, _ params: JSONValue) async throws -> ActionResult {
+        let r = try await settledCall("_p2pact/\(name)", params, stream: streamOf(params.str("sessionId")))
+        let lines = r.objs("lines")
+        if let ok = r.bool("ok") { return ActionResult(ok: ok, error: r.str("error"), lines: lines, raw: r) }
+        // an older engine: no `ok`; a refusal is the line `alert`
+        let alert = lines.first { $0.str("cmd") == "alert" }
+        return ActionResult(ok: alert == nil, error: alert?.str("text") ?? alert?.str("error"), lines: lines, raw: r)
+    }
+
     /// close closes the chat: it leaves the list.
     @discardableResult
-    public func close(_ sessionId: String) async throws -> [JSONValue] { try await command("close", params: ["sessionId": .string(sessionId)]) }
+    public func close(_ sessionId: String) async throws -> ActionResult { try await action("close", ["sessionId": .string(sessionId)]) }
 
     /// restart starts the agent of a chat again.
     @discardableResult
-    public func restart(_ sessionId: String) async throws -> [JSONValue] { try await command("restart", params: ["sessionId": .string(sessionId)]) }
+    public func restart(_ sessionId: String) async throws -> ActionResult { try await action("restart", ["sessionId": .string(sessionId)]) }
 
     /// hide hides a chat from the list (on) or shows it again.
     @discardableResult
-    public func hide(_ sessionId: String, on: Bool = true) async throws -> [JSONValue] {
-        try await command("hide", params: ["sessionId": .string(sessionId), "on": .bool(on)])
+    public func hide(_ sessionId: String, on: Bool = true) async throws -> ActionResult {
+        try await action("hide", ["sessionId": .string(sessionId), "on": .bool(on)])
     }
+
+    /// historyOpen is `_p2pact/history_open`: opens a past conversation (an item of `history`) as a chat.
+    @discardableResult
+    public func historyOpen(_ id: String) async throws -> ActionResult { try await action("history_open", ["sessionId": .string(id)]) }
 
     /// older is `_p2pact/older`: the page of messages just before `before` (the `seq` of the oldest you have).
     public func older(_ sessionId: String, before: Int64) async throws -> OlderPage {
-        let lines = try await command("older", params: ["sessionId": .string(sessionId), "before": .int(before)])
-        let l = lines.first { $0.str("cmd") == "older" } ?? .object([:])
+        let (l, _) = try await extCall("older", ["sessionId": .string(sessionId), "before": .int(before)], keys: ["messages"])
         let msgs = l.objs("messages").map { m in
             ChatMessage(seq: m.long("seq") ?? 0, role: m.str("role") ?? "", text: m.str("text") ?? "", time: m.str("time"),
                         images: m["images"]?.arrayValue?.compactMap { $0.stringValue } ?? [], raw: m)
         }
-        return OlderPage(sessionId: sessionId, messages: msgs, more: l.bool("more") ?? false, raw: l)
+        return OlderPage(sessionId: sessionId, messages: msgs, more: l.bool("more") ?? false, run: l.str("run"), raw: l)
     }
 
     /// diff is `_p2pact/diff`: the changes in the chat's folder (git).
     public func diff(_ sessionId: String) async throws -> DiffResult {
-        let lines = try await command("diff", params: ["sessionId": .string(sessionId)])
-        let l = lines.first { $0.str("cmd") == "diff" } ?? .object([:])
+        let (l, _) = try await extCall("diff", ["sessionId": .string(sessionId)], keys: ["files", "patch", "error"])
         let files = l.objs("files").map { DiffFile(path: $0.str("path") ?? "", added: $0.int("added") ?? 0, removed: $0.int("removed") ?? 0, status: $0.str("status")) }
         return DiffResult(files: files, patch: l.str("patch") ?? "", truncated: l.bool("truncated") ?? false, error: l.str("error"), raw: l)
     }
 
     /// image is `_p2pact/image`: the bytes (base64) of an image a message points to.
     public func image(_ sessionId: String, path: String) async throws -> ImageResult {
-        let lines = try await command("image", params: ["sessionId": .string(sessionId), "path": .string(path)])
-        let l = lines.first { $0.str("cmd") == "image" } ?? .object([:])
-        return ImageResult(data: l.str("data"), error: l.str("error"), raw: l)
+        let (l, _) = try await extCall("image", ["sessionId": .string(sessionId), "path": .string(path)], keys: ["path", "data", "error"])
+        return ImageResult(path: l.str("path"), mime: l.str("mime"), data: l.str("data"), error: l.str("error"), raw: l)
+    }
+
+    /// commands is `_p2pact/commands`: the slash commands of a chat.
+    public func commands(_ sessionId: String) async throws -> [ChatCommand] {
+        let (l, _) = try await extCall("commands", ["sessionId": .string(sessionId)], keys: ["commands"])
+        let list = l["commands"] != nil ? l.objs("commands") : l.objs("list")
+        return list.map { c in
+            ChatCommand(name: c.str("name") ?? "", desc: c.str("desc"), hint: c.str("hint"),
+                        args: c.objs("args").map { CommandArg(value: $0.str("value") ?? "", desc: $0.str("desc")) }, raw: c)
+        }
+    }
+
+    /// files is `_p2pact/files`: paths in the chat's folder that match `query`.
+    public func files(_ sessionId: String, query: String) async throws -> FilesResult {
+        let (l, _) = try await extCall("files", ["sessionId": .string(sessionId), "query": .string(query)], keys: ["files"])
+        let list = l["files"] != nil ? l.strings("files") : l.strings("list")
+        return FilesResult(files: list, query: l.str("query") ?? query, raw: l)
+    }
+
+    /// history is `_p2pact/history`: past conversations of the computer's agents, a page from `offset`.
+    /// Continue from `cursor` while it is there.
+    public func history(query: String = "", offset: Int = 0) async throws -> HistoryPage {
+        let (l, _) = try await extCall("history", ["query": .string(query), "offset": .int(Int64(offset))], keys: ["items"])
+        let list = l["items"] != nil ? l.objs("items") : l.objs("list")
+        let items = list.map { h in
+            HistoryItem(id: h.str("id") ?? "", agent: h.str("agent"), dir: h.str("dir"), title: h.str("title"),
+                        updated: h.long("updated"), count: h.int("count"), raw: h)
+        }
+        return HistoryPage(items: items, query: l.str("query") ?? query, from: l.int("from") ?? offset, total: l.int("total") ?? items.count,
+                           cursor: l.int("cursor"), partial: l.bool("partial") ?? false, raw: l)
+    }
+
+    /// projects is `_p2pact/projects`: the folders the computer works in (for `cwd`, the ones of that project).
+    public func projects(cwd: String? = nil) async throws -> ProjectsResult {
+        var p: [String: JSONValue] = [:]
+        if let c = cwd { p["cwd"] = .string(c) }
+        let (l, _) = try await extCall("projects", .object(p), keys: ["dirs", "project_dirs", "dir_repos"])
+        var pd: [String: [String]] = [:]
+        for (k, v) in l["project_dirs"]?.objectValue ?? [:] { pd[k] = v.arrayValue?.compactMap { $0.stringValue } ?? [] }
+        var dr: [String: String] = [:]
+        for (k, v) in l["dir_repos"]?.objectValue ?? [:] { if let s = v.stringValue { dr[k] = s } }
+        return ProjectsResult(dirs: l.strings("dirs"), projectDirs: pd, dirRepos: dr, raw: l)
+    }
+
+    /// agents is `_p2pact/agents`: the agents the computer can start and the presets.
+    public func agents() async throws -> AgentsResult {
+        let r = try await settledCall("_p2pact/agents", [:], stream: 0)
+        var agents = r.objs("agents")
+        var presets = r.objs("presets")
+        if r["agents"] == nil && r["presets"] == nil { // an older engine: two lines with `list`
+            let lines = r.objs("lines")
+            agents = lines.first { $0.str("cmd") == "agents" }?.objs("list") ?? []
+            presets = lines.first { $0.str("cmd") == "presets" }?.objs("list") ?? []
+        }
+        return AgentsResult(
+            agents: agents.map { a in
+                ChatAgent(id: a.str("id") ?? "", name: a.str("name") ?? a.str("id") ?? "", type: a.str("type"), enabled: a.bool("enabled") ?? true,
+                          models: a.strings("models"), defaultModel: a.str("default"), raw: a)
+            },
+            presets: presets.map { AgentPreset(id: $0.str("id") ?? "", name: $0.str("name") ?? "", raw: $0) },
+            raw: r)
     }
 
     // --- from the computer ---
