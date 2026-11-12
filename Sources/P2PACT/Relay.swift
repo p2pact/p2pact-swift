@@ -10,7 +10,7 @@ import Security
 //   -> "p" keepalive, answered with "P"; any other line is forwarded to the other side.
 
 /// TLSLine is a blocking wrapper over an NWConnection: connect, send, receive with timeouts.
-private final class TLSStream {
+final class TLSStream {
     private let conn: NWConnection
     private let q = DispatchQueue(label: "p2pact-relay-nw")
     private let lock = NSLock()
@@ -101,7 +101,7 @@ private final class TLSStream {
 }
 
 /// LineReader cuts the byte stream of a TLSStream into lines.
-private final class LineReader {
+final class LineReader {
     private let s: TLSStream
     private var buf = Bytes()
     init(_ s: TLSStream) { self.s = s }

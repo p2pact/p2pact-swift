@@ -5,6 +5,10 @@ Swift implementation of [P2PACT](https://github.com/p2pact/p2pact) (macOS 13+, i
 - `P2PACT` library: identity, invites, pairing and known-device handshakes, sessions, delivery,
   CBOR messages, tool 0, named tools, grants and wants, UDP / TCP / relay / local-socket /
   application roads, zstd compression with dictionaries (incl. training).
+- Short code (spec §2, code slots §3): `Code.normalize(_:)`, `Code.fetchInvite(code:relay:timeout:)` gets
+  the invite shown under a typed 8-symbol code from a relay (`CodeNotFoundError`, `CodeUnsupportedError`),
+  `Code.inviteFromTxt(_:txt:)` opens a `_p2pact._udp` record (browsing is the application's). A joiner's
+  side only: publishing a code is not here.
 - `allowForward(a, b, on)` — opt this device in as a forwarder between two devices it trusts
   (spec §3, via a third device): they reach each other through it when nothing else works, end
   to end encrypted. Kept with the trusted list; `forwardRate` limits each direction (256 KB/s by
