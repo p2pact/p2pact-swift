@@ -31,7 +31,11 @@ let ACK_DELAY = 40 * MS
 let CWND_START = 32.0 // parts in flight at first
 let CWND_MIN = 32.0
 let CWND_MAX = 4096.0
-let GOT_MAX = 8192 // parts held above the first gap
+// GOT_MAX is how far past the first gap a part may be: the receiver drops parts at
+// recvAck+GOT_MAX and beyond, the sender keeps new parts below its lowest unacked+GOT_MAX.
+// (A bound on the number of parts held would drop the very part the gap waits for once
+// that many arrived above it, and delivery would stop for good.)
+let GOT_MAX = 8192
 // MSG_MAX (longer messages abort reassembly) is defined with compression
 let LINK_QUEUE = SEC
 
@@ -283,7 +287,7 @@ final class Delivery {
             retry = true
             rp.timer = rp.sent != 0 // not taken as lost by an ack: the timer ran out
             lost(now)
-        } else if !queue.isEmpty && canSend() {
+        } else if !queue.isEmpty && canSend() && (lowest == 0 || queue.first!.seq - lowest < Int64(GOT_MAX)) {
             let np = queue.removeFirst()
             p = np
             inflight[np.seq] = np
@@ -438,7 +442,7 @@ final class Delivery {
         // like TCP: ack at once every second part, and on anything out of order
         unacked += 1
         if unacked >= 2 || seq != recvAck { ackDue = now }
-        if seq < recvAck || got[seq] != nil || got.count >= GOT_MAX { return true } // duplicate, or too far ahead
+        if seq < recvAck || got[seq] != nil || seq - recvAck >= Int64(GOT_MAX) { return true } // duplicate, or too far ahead
         got[seq] = RPart(data: Bytes(b[r.pos...]), more: flags & F_MORE != 0, zip: flags & F_ZIP != 0, first: first,
                          streamed: streamed, stream: st, num: num)
         while got[recvAck] != nil { recvAck += 1 }

@@ -246,6 +246,63 @@ final class DeliveryTests: XCTestCase {
         }
     }
 
+    /// A lost part with more than GOT_MAX parts sent after it: the receiver must still take the
+    /// part its gap waits for, and the sender must not run GOT_MAX past it. Before, the receiver
+    /// bounded the number of parts held above the gap: once GOT_MAX arrived it dropped every copy
+    /// of the missing part, and delivery stopped for good while the session stayed alive.
+    func testGapPastGotMax() {
+        let a = Delivery(), b = Delivery()
+        a.reliable = true // like TCP: no fast retransmit, the gap waits for the timer
+        let n = GOT_MAX + 2000
+        for i in 0..<n { a.push(Bytes("m\(i)".utf8), zip: false, stream: 0) }
+        var got: [String] = []
+        var now: Int64 = 10 * SEC
+        var dropped = false
+        var step = 0
+        while step < 20000 && got.count < n {
+            step += 1
+            now += 5 * MS
+            for _ in 0..<256 {
+                guard let p = a.nextPacket(now, false) else { break }
+                if !dropped { dropped = true; continue } // the first copy of part 1 is lost
+                _ = b.receive(now, p.plain) { m, _, _ in got.append(String(decoding: m, as: UTF8.self)) }
+                if b.got.count > GOT_MAX + 1 { XCTFail("receiver holds \(b.got.count) parts"); return }
+            }
+            while let p = b.nextPacket(now, true) {
+                if p.plain.count <= 1 { break }
+                _ = a.receive(now, p.plain) { _, _, _ in }
+                if b.ackDue == 0 { break }
+            }
+        }
+        XCTAssertEqual(got.count, n, "recvAck=\(b.recvAck) got=\(b.got.count) inflight=\(a.inflight.count) queue=\(a.queue.count)")
+        XCTAssertEqual(got, (0..<n).map { "m\($0)" })
+    }
+
+    /// The receiver alone (an old sender runs ahead): the part at recvAck is taken even with
+    /// GOT_MAX-1 parts held above it, and a part GOT_MAX past it is dropped.
+    func testReceiveWindow() {
+        let a = Delivery(), b = Delivery()
+        a.reliable = true
+        for i in 0..<GOT_MAX + 1 { a.push([UInt8(i & 0xff)], zip: false, stream: 0) }
+        var pkts: [Bytes] = []
+        let now: Int64 = 10 * SEC
+        while pkts.count < GOT_MAX + 1 {
+            guard let p = a.nextPacket(now, false) else { // the window: let everything sent so far count as acked
+                a.inflight.removeAll()
+                a.inflightBytes = 0
+                continue
+            }
+            pkts.append(p.plain)
+        }
+        var n = 0
+        for p in pkts.dropFirst() { _ = b.receive(now, p) { _, _, _ in n += 1 } }
+        XCTAssertEqual(b.got.count, GOT_MAX - 1)
+        XCTAssertEqual(b.recvAck, 1)
+        _ = b.receive(now, pkts[0]) { _, _, _ in n += 1 }
+        XCTAssertEqual(b.recvAck, Int64(GOT_MAX + 1))
+        XCTAssertEqual(n, GOT_MAX)
+    }
+
     func testRestartRenumbers() {
         let a = Delivery()
         a.push(Bytes("one".utf8), zip: false, stream: 0)
