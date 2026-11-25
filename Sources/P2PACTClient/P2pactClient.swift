@@ -10,6 +10,8 @@ public enum Tools {
     /// A computer that knows it by a former name still answers once the alias is declared:
     /// `client.node.aliasTool(former, Tools.term)`.
     public static let term = "p2pact.term"
+    /// The screens (tool 6, spec screen.md): level 1 looks, level 2 also types and clicks. No typed client either.
+    public static let screen = "p2pact.screen"
 
     static let chatNumber = 1
     static let fleetNumber = 2

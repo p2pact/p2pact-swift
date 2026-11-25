@@ -46,6 +46,7 @@ final class TermTests: XCTestCase {
 
     func testFixedTable() throws {
         XCTAssertEqual(fixedTool("p2pact.term"), 5)
+        XCTAssertEqual(fixedTool("p2pact.screen"), 6)
         XCTAssertNil(fixedTool(former))
         let a = try node("Mac")
         XCTAssertThrowsError(try a.registerTool("p2pact.term", 1), "a name of the spec is not a named tool")
