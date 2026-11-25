@@ -124,6 +124,12 @@ public final class Identity {
         addr = Crypto.address(key.publicKey)
     }
 
+    /// generate makes fresh keys held in memory only: nothing is written (a window that tells its key to its
+    /// own computer over stdin, so that programs reading the data folder cannot take it).
+    public static func generate() -> Identity {
+        Identity(key: Crypto.x25519Keypair(), sign: Crypto.ed25519Keypair(randomBytes(32)))
+    }
+
     /// shared derives a pair secret with pub without pairing (devices known from the family book).
     func shared(_ pub: Bytes, _ label: String) -> Bytes { Crypto.mac(Crypto.x25519(key.privateKey, pub) ?? [], label) }
 
@@ -223,14 +229,21 @@ public struct Peer {
     /// The devices we forward to for this one (spec §3, Node.allowForward); the consent is for the pair, so each of the
     /// two lists the other.
     public var forward: [String] = []
+    /// The device is on this computer and is reached over the local socket only, as a plugin is (spec §2, as
+    /// p2pact-go's LocalOnly): no UDP, TCP or relay channel for it, and a session start from it on another road
+    /// is ignored.
+    public var localOnly = false
 
-    init(addr: String, key: Bytes, name: String, pairSecret: Bytes, hints: Hints, added: Int64 = 0, signKey: Bytes? = nil,
+    public init(addr: String, key: Bytes, name: String, pairSecret: Bytes, hints: Hints, added: Int64 = 0, signKey: Bytes? = nil,
          os: String? = nil, via: String? = nil, kind: Int = Kind.unknown, grants: [Grant]? = nil, granted: [Grant]? = nil, local: Bool = false,
-         forward: [String] = []) {
+         forward: [String] = [], localOnly: Bool = false) {
         self.addr = addr; self.key = key; self.name = name; self.pairSecret = pairSecret; self.hints = hints; self.added = added
         self.signKey = signKey; self.os = os; self.via = via; self.kind = kind; self.grants = grants; self.granted = granted
-        self.local = local; self.forward = forward
+        self.local = local; self.forward = forward; self.localOnly = localOnly
     }
+
+    /// onlyLocal: reached over the local socket only — a plugin, or a device marked localOnly.
+    var onlyLocal: Bool { kind == Kind.plugin || localOnly }
 
     /// relayChannel is the pair's relay channel: only these two devices know it (spec §3).
     var relayChannel: String { Bytes(Crypto.mac(pairSecret, "relay")[0..<16]).hex() }
@@ -260,7 +273,8 @@ final class Trust {
                          signKey: unb64(m["sign_key"] as? String), os: m["os"] as? String, via: m["via"] as? String,
                          kind: (m["kind"] as? NSNumber)?.intValue ?? 0, grants: grantsFromJson(m["grants"]),
                          granted: grantsFromJson(m["granted"]), local: (m["local"] as? Bool) ?? false,
-                         forward: (m["forward"] as? [Any])?.compactMap { $0 as? String } ?? [])
+                         forward: (m["forward"] as? [Any])?.compactMap { $0 as? String } ?? [],
+                         localOnly: (m["local_only"] as? Bool) ?? false)
             if p.key.count == 32 && Crypto.address(p.key) == p.addr { peers[p.addr] = p }
         }
     }
@@ -350,6 +364,7 @@ final class Trust {
             if let g = p.granted { m["granted"] = grantsToJson(g) }
             if p.local { m["local"] = true }
             if !p.forward.isEmpty { m["forward"] = p.forward }
+            if p.localOnly { m["local_only"] = true }
             return m
         }
         guard let b = try? JSONSerialization.data(withJSONObject: list, options: [.prettyPrinted, .sortedKeys]) else { return }
