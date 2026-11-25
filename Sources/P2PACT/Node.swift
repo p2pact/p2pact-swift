@@ -253,12 +253,14 @@ public final class Node {
     /// forwardTap sees what we forward (tests); called on the node's queue.
     private var forwardTap: ((_ from: String, _ to: String, _ pkt: Bytes) -> Void)?
 
-    public init(dir: String, name: String, timing: LearnTiming = LearnTiming()) throws {
+    /// A node keeping its state in dir. `identity` — keys the application holds in memory (`Identity.generate`):
+    /// then dir/net-key.json is neither read nor written; nil — the keys of dir/net-key.json, made if missing.
+    public init(dir: String, name: String, identity: Identity? = nil, timing: LearnTiming = LearnTiming()) throws {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         self.dir = dir
         self.name = name
         self.timing = timing
-        id = try Identity.load(dir: dir)
+        id = try identity ?? Identity.load(dir: dir)
         trust = Trust(dir: dir)
         dicts = DictStore(dir: dir, io: io)
         dicts.listedBy = { [unowned self] d in // on the node's queue, as every change of the store
@@ -738,6 +740,18 @@ public final class Node {
 
     public func peer(_ addr: String) -> Peer? { trust.get(addr) }
 
+    /// trustLocal adds a device on this computer we know without pairing — its key comes from the computer itself
+    /// (a window started by its computer, spec §2 «Local programs»): reached over the local socket only (localOnly;
+    /// `local` — we dial it at the socket of `useLocal`). Its key must match its address; a known device is replaced.
+    public func trustLocal(_ p0: Peer) throws {
+        if p0.key.count != 32 || Crypto.address(p0.key) != p0.addr { throw P2pactError(Errors.badArgs, "key does not match address") }
+        if p0.addr == id.addr { throw P2pactError(Errors.badArgs, "that is this device") }
+        var p = p0
+        p.localOnly = true
+        p.hints = Hints()
+        onLoop { trust.put(p) }
+    }
+
     // --- calls and events ---
 
     /// callOn invokes tool.method on a known device on a stream (0 — the ordered default) and completes with the
@@ -901,7 +915,7 @@ public final class Node {
             if now >= ps.burstUntil || onDirect(peer, ps, now) { ps.burstUntil = 0; continue }
             if now < ps.burstNext { continue }
             ps.burstNext = now + punchEvery
-            guard let s = current[peer], let u = udp, let p = trust.get(peer), p.kind != Kind.plugin else { continue }
+            guard let s = current[peer], let u = udp, let p = trust.get(peer), !p.onlyLocal else { continue }
             for a in p.hints.udp { sealTo(s, epState(ps, Endpoint(road: u, addr: a)), now, keepalive()) }
         }
     }
@@ -990,7 +1004,7 @@ public final class Node {
               let payload = try? h.readMessage(Bytes(pkt[5...])), payload.count >= 12, let rs = h.rs else { return }
         let peer = Crypto.address(rs)
         guard let known = trust.get(peer) else { return } // silence to strangers
-        if known.kind == Kind.plugin && !isLocal(from) { return } // a plugin is reachable over the local socket only (spec §2)
+        if known.onlyLocal && !isLocal(from) { return } // a plugin (or a localOnly device) is reachable over the local socket only (spec §2)
         guard let ps = peerState(peer) else { return }
         let ts = u64(payload, 0)
         let age = wallMillis() * MS - ts
@@ -1387,7 +1401,7 @@ public final class Node {
             if !out.contains(where: { $0 === e }) { out.append(e) }
         }
         if p.local, let lr = loc, let lp = localPathValue { add(Endpoint(road: lr, addr: lp)) } // the device we dial on this computer
-        if p.kind == Kind.plugin { return out } // reachable over the local socket only, on the connection it opened
+        if p.onlyLocal { return out } // reachable over the local socket only (a plugin — on the connection it opened)
         if let u = udp { for a in p.hints.udp { add(Endpoint(road: u, addr: a)) } }
         if let t = tcp { for a in p.hints.tcp { add(Endpoint(road: t, addr: a)) } }
         if let r = pairRelay(p) { add(Endpoint(road: r, addr: p.relayChannel)) }
@@ -1469,6 +1483,7 @@ public final class Node {
 
     /// pairRelay picks the pair's relay: the one of the lower address, else the other's.
     private func pairRelay(_ p: Peer) -> RelayRoad? {
+        if p.onlyLocal { return nil } // no relay channel for a device on the local socket only
         let mine = ownRelay
         let theirs = p.hints.relay
         let (first, second) = p.addr < id.addr ? (theirs, mine) : (mine, theirs)
